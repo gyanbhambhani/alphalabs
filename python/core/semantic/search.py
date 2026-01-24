@@ -189,16 +189,9 @@ class SemanticSearchEngine:
         
         # Get regime info from metadata
         metadata = current_state.metadata
-        returns = metadata.get('returns', {})
-        vol = metadata.get('volatility', {})
-        
-        # Build interpretation
-        parts = []
-        
-        # Describe current conditions
-        mom_1m = returns.get('1m', 0)
-        mom_3m = returns.get('3m', 0)
-        vol_21d = vol.get('21d', 0)
+        mom_1m = metadata.get('return_1m', 0)
+        mom_3m = metadata.get('return_3m', 0)
+        vol_21d = metadata.get('volatility_21d', 0)
         
         if vol_21d < 0.15:
             vol_desc = "low volatility"

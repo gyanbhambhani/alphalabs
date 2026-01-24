@@ -151,15 +151,46 @@ export default function Dashboard() {
   const [isLive, setIsLive] = useState(false);
 
   useEffect(() => {
-    // Load mock data
-    setLeaderboard(MOCK_LEADERBOARD);
-    setSignals(MOCK_SIGNALS);
-    setTrades(MOCK_TRADES);
+    const loadData = async () => {
+      try {
+        // Import API client
+        const { api } = await import('@/lib/api');
+        
+        // Check health
+        try {
+          await api.healthCheck();
+          setIsLive(true);
+          
+          // Load real data
+          const [leaderboardData, signalsData, tradesData] = await Promise.all([
+            api.getLeaderboard(),
+            api.getSignals(),
+            api.getTrades(),
+          ]);
+          
+          setLeaderboard(leaderboardData);
+          setSignals(signalsData);
+          setTrades(tradesData);
+        } catch (err) {
+          console.log('API not available, using mock data');
+          setIsLive(false);
+          
+          // Fallback to mock data
+          setLeaderboard(MOCK_LEADERBOARD);
+          setSignals(MOCK_SIGNALS);
+          setTrades(MOCK_TRADES);
+        }
+      } catch (error) {
+        console.error('Error loading data:', error);
+        // Use mock data on error
+        setLeaderboard(MOCK_LEADERBOARD);
+        setSignals(MOCK_SIGNALS);
+        setTrades(MOCK_TRADES);
+        setIsLive(false);
+      }
+    };
     
-    // Check if API is available
-    fetch('/api/health')
-      .then(() => setIsLive(true))
-      .catch(() => setIsLive(false));
+    loadData();
   }, []);
 
   const managerNames: Record<string, string> = {};

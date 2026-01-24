@@ -339,22 +339,18 @@ class MarketStateEncoder:
         if norm > 0:
             vector = vector / norm
         
-        # Metadata for interpretability
+        # Metadata for interpretability (flattened for ChromaDB)
         metadata = {
             "date": date,
-            "returns": {
-                "1w": float(returns[0]),
-                "1m": float(returns[1]),
-                "3m": float(returns[2]),
-                "6m": float(returns[3]),
-                "12m": float(returns[4])
-            },
-            "volatility": {
-                "5d": float(volatility[0]),
-                "10d": float(volatility[1]),
-                "21d": float(volatility[2]),
-                "63d": float(volatility[3])
-            },
+            "return_1w": float(returns[0]),
+            "return_1m": float(returns[1]),
+            "return_3m": float(returns[2]),
+            "return_6m": float(returns[3]),
+            "return_12m": float(returns[4]),
+            "volatility_5d": float(volatility[0]),
+            "volatility_10d": float(volatility[1]),
+            "volatility_21d": float(volatility[2]),
+            "volatility_63d": float(volatility[3]),
             "price": float(close.iloc[-1]) if len(close) > 0 else 0
         }
         

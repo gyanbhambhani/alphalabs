@@ -251,12 +251,26 @@ async def get_leaderboard(db: AsyncSession = Depends(get_db)):
     return entries
 
 
-# Trading cycle trigger (for testing)
+# Trading cycle trigger
 @app.post("/api/trading/cycle")
 async def trigger_trading_cycle():
-    """Manually trigger a trading cycle (for testing)"""
-    # This will be implemented to actually run the trading loop
-    return {"message": "Trading cycle triggered", "timestamp": datetime.utcnow()}
+    """Manually trigger a trading cycle"""
+    try:
+        from core.execution.scheduler import TradingScheduler
+        
+        scheduler = TradingScheduler()
+        result = await scheduler.run_once()
+        
+        return {
+            "success": True,
+            "message": "Trading cycle completed",
+            "result": result
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Trading cycle failed: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
