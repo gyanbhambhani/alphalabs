@@ -1,6 +1,6 @@
 from db.models import (
     Base, Manager, Portfolio, Position, Trade, 
-    DailySnapshot, SignalSnapshot, MarketData
+    DailySnapshot, SignalSnapshot, MarketData, Stock
 )
 from db.database import (
     init_db, drop_db, get_sync_session, 
@@ -9,7 +9,7 @@ from db.database import (
 
 __all__ = [
     "Base", "Manager", "Portfolio", "Position", "Trade",
-    "DailySnapshot", "SignalSnapshot", "MarketData",
+    "DailySnapshot", "SignalSnapshot", "MarketData", "Stock",
     "init_db", "drop_db", "get_sync_session", 
     "get_async_session", "get_db"
 ]

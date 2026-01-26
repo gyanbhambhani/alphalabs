@@ -1,211 +1,145 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Leaderboard } from '@/components/Leaderboard';
-import { ManagerCard } from '@/components/ManagerCard';
-import { SignalDisplay } from '@/components/SignalDisplay';
-import { TradeHistory } from '@/components/TradeHistory';
-import { PortfolioChart } from '@/components/PortfolioChart';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
-import type { 
-  LeaderboardEntry, 
-  StrategySignals, 
-  Trade, 
-  DailySnapshot 
+import { SearchBar } from '@/components/SearchBar';
+import { EmbeddingsTable } from '@/components/EmbeddingsTable';
+import { EmbeddingsTimeline } from '@/components/EmbeddingsTimeline';
+import { EmbeddingDetail } from '@/components/EmbeddingDetail';
+import { StockSelector } from '@/components/StockSelector';
+import { MultiStockCompare } from '@/components/MultiStockCompare';
+import { api } from '@/lib/api';
+import type {
+  Embedding,
+  EmbeddingsStats,
+  Stock,
 } from '@/types';
 
-// Mock data for development (will be replaced with API calls)
-const MOCK_MANAGERS = [
-  { id: 'gpt4', name: 'GPT-4 Fund', type: 'llm' as const, provider: 'openai' as const, isActive: true },
-  { id: 'claude', name: 'Claude Fund', type: 'llm' as const, provider: 'anthropic' as const, isActive: true },
-  { id: 'gemini', name: 'Gemini Fund', type: 'llm' as const, provider: 'google' as const, isActive: true },
-  { id: 'quant', name: 'Quant Bot', type: 'quant' as const, provider: null, isActive: true },
-];
-
-const MOCK_LEADERBOARD: LeaderboardEntry[] = [
-  {
-    rank: 1,
-    manager: MOCK_MANAGERS[1],
-    portfolio: { managerId: 'claude', cashBalance: 12000, totalValue: 28400, updatedAt: new Date().toISOString() },
-    sharpeRatio: 1.82,
-    totalReturn: 0.124,
-    volatility: 0.082,
-    maxDrawdown: -0.042,
-    totalTrades: 47,
-    winRate: 0.62,
-  },
-  {
-    rank: 2,
-    manager: MOCK_MANAGERS[0],
-    portfolio: { managerId: 'gpt4', cashBalance: 8000, totalValue: 28775, updatedAt: new Date().toISOString() },
-    sharpeRatio: 1.54,
-    totalReturn: 0.151,
-    volatility: 0.118,
-    maxDrawdown: -0.061,
-    totalTrades: 62,
-    winRate: 0.58,
-  },
-  {
-    rank: 3,
-    manager: MOCK_MANAGERS[3],
-    portfolio: { managerId: 'quant', cashBalance: 15000, totalValue: 27050, updatedAt: new Date().toISOString() },
-    sharpeRatio: 1.21,
-    totalReturn: 0.082,
-    volatility: 0.071,
-    maxDrawdown: -0.038,
-    totalTrades: 31,
-    winRate: 0.65,
-  },
-  {
-    rank: 4,
-    manager: MOCK_MANAGERS[2],
-    portfolio: { managerId: 'gemini', cashBalance: 5000, totalValue: 27750, updatedAt: new Date().toISOString() },
-    sharpeRatio: 0.92,
-    totalReturn: 0.11,
-    volatility: 0.142,
-    maxDrawdown: -0.085,
-    totalTrades: 58,
-    winRate: 0.52,
-  },
-];
-
-const MOCK_SIGNALS: StrategySignals = {
-  momentum: [
-    { symbol: 'NVDA', score: 0.85 },
-    { symbol: 'MSFT', score: 0.62 },
-    { symbol: 'AAPL', score: 0.45 },
-    { symbol: 'GOOGL', score: 0.38 },
-    { symbol: 'META', score: 0.22 },
-    { symbol: 'TSLA', score: -0.15 },
-    { symbol: 'AMD', score: -0.32 },
-  ],
-  meanReversion: [
-    { symbol: 'TSLA', score: 0.72 },
-    { symbol: 'AMD', score: 0.58 },
-    { symbol: 'NVDA', score: -0.45 },
-    { symbol: 'MSFT', score: -0.22 },
-  ],
-  technical: [],
-  mlPrediction: [
-    { symbol: 'NVDA', predictedReturn: 0.023, confidence: 0.72 },
-    { symbol: 'MSFT', predictedReturn: 0.015, confidence: 0.68 },
-    { symbol: 'TSLA', predictedReturn: -0.018, confidence: 0.61 },
-  ],
-  volatilityRegime: 'low_vol_trending_up',
-  semanticSearch: {
-    similarPeriods: [
-      { date: '2023-11-15', similarity: 0.92, return5d: 0.032, return20d: 0.078 },
-      { date: '2021-03-22', similarity: 0.88, return5d: 0.025, return20d: 0.065 },
-      { date: '2019-10-28', similarity: 0.85, return5d: 0.018, return20d: 0.042 },
-      { date: '2024-02-12', similarity: 0.82, return5d: 0.028, return20d: 0.058 },
-      { date: '2020-06-08', similarity: 0.79, return5d: -0.012, return20d: 0.035 },
-    ],
-    avg5dReturn: 0.0182,
-    avg20dReturn: 0.0556,
-    positive5dRate: 0.72,
-    interpretation: 'Current market conditions resemble low-volatility tech rallies. ' +
-      'Historically, similar periods led to continued gains with 72% positive outcomes over 5 days.',
-  },
-  timestamp: new Date().toISOString(),
-};
-
-const MOCK_TRADES: Trade[] = [
-  {
-    id: 1,
-    managerId: 'gpt4',
-    symbol: 'NVDA',
-    side: 'buy',
-    quantity: 15,
-    price: 142.50,
-    reasoning: 'Strong momentum signal (+0.85) aligned with semantic search showing 72% positive outcomes in similar periods.',
-    executedAt: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-  },
-  {
-    id: 2,
-    managerId: 'claude',
-    symbol: 'MSFT',
-    side: 'buy',
-    quantity: 20,
-    price: 425.30,
-    reasoning: 'Low volatility trending regime favors quality tech. ML prediction shows +1.5% expected return.',
-    executedAt: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
-  },
-  {
-    id: 3,
-    managerId: 'quant',
-    symbol: 'NVDA',
-    side: 'buy',
-    quantity: 10,
-    price: 141.80,
-    signalsUsed: { momentum: 0.85, semantic: 0.72 },
-    executedAt: new Date(Date.now() - 1000 * 60 * 90).toISOString(),
-  },
-];
-
-export default function Dashboard() {
-  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
-  const [signals, setSignals] = useState<StrategySignals | null>(null);
-  const [trades, setTrades] = useState<Trade[]>([]);
-  const [snapshots] = useState<Record<string, DailySnapshot[]>>({});
+export default function EmbeddingsExplorer() {
+  const [selectedSymbol, setSelectedSymbol] = useState<string>('');
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
+  const [viewMode, setViewMode] = useState<'single' | 'compare'>('single');
+  
+  const [stats, setStats] = useState<EmbeddingsStats | null>(null);
+  const [embeddings, setEmbeddings] = useState<Embedding[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [perPage] = useState(50);
+  const [sortBy, setSortBy] = useState<
+    'date' | 'return_1m' | 'volatility_21d' | 'price'
+  >('date');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [isLoading, setIsLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchInterpretation, setSearchInterpretation] = useState('');
+  const [selectedEmbedding, setSelectedEmbedding] = useState<Embedding | null>(
+    null
+  );
+  const [activeTab, setActiveTab] = useState<'table' | 'timeline'>('table');
   const [isLive, setIsLive] = useState(false);
 
+  // Load stats when symbol changes
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        // Import API client
-        const { api } = await import('@/lib/api');
-        
-        // Check health
-        try {
-          await api.healthCheck();
-          setIsLive(true);
-          
-          // Load real data
-          const [leaderboardData, signalsData, tradesData] = await Promise.all([
-            api.getLeaderboard(),
-            api.getSignals(),
-            api.getTrades(),
-          ]);
-          
-          setLeaderboard(leaderboardData);
-          setSignals(signalsData);
-          setTrades(tradesData);
-        } catch (err) {
-          console.log('API not available, using mock data');
-          setIsLive(false);
-          
-          // Fallback to mock data
-          setLeaderboard(MOCK_LEADERBOARD);
-          setSignals(MOCK_SIGNALS);
-          setTrades(MOCK_TRADES);
-        }
-      } catch (error) {
-        console.error('Error loading data:', error);
-        // Use mock data on error
-        setLeaderboard(MOCK_LEADERBOARD);
-        setSignals(MOCK_SIGNALS);
-        setTrades(MOCK_TRADES);
-        setIsLive(false);
-      }
-    };
+    if (selectedSymbol) {
+      loadStats();
+    }
+  }, [selectedSymbol]);
+
+  // Load embeddings when params change
+  useEffect(() => {
+    if (selectedSymbol) {
+      loadEmbeddings();
+    }
+  }, [selectedSymbol, page, sortBy, sortOrder, searchQuery]);
+
+  const loadStats = async () => {
+    if (!selectedSymbol) return;
     
-    loadData();
-  }, []);
+    try {
+      const data = await api.getEmbeddingsStatsForSymbol(selectedSymbol);
+      setStats(data);
+      setIsLive(true);
+    } catch (error) {
+      console.error('Failed to load stats:', error);
+      setIsLive(false);
+    }
+  };
 
-  const managerNames: Record<string, string> = {};
-  MOCK_MANAGERS.forEach((m) => {
-    managerNames[m.id] = m.name;
-  });
+  const loadEmbeddings = async () => {
+    if (!selectedSymbol) return;
+    
+    setIsLoading(true);
+    try {
+      if (searchQuery) {
+        // Use search endpoint
+        const result = await api.searchEmbeddingsForSymbol(
+          selectedSymbol,
+          searchQuery,
+          perPage
+        );
+        setEmbeddings(result.results);
+        setTotal(result.total);
+        setSearchInterpretation(result.interpretation);
+      } else {
+        // Use list endpoint
+        const result = await api.getEmbeddingsForSymbol(selectedSymbol, {
+          page,
+          perPage,
+          sortBy,
+          order: sortOrder,
+        });
+        setEmbeddings(result.embeddings);
+        setTotal(result.total);
+        setSearchInterpretation('');
+      }
+    } catch (error) {
+      console.error('Failed to load embeddings:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
-  const totalValue = leaderboard.reduce(
-    (sum, e) => sum + e.portfolio.totalValue,
-    0
-  );
-  
-  const avgReturn = leaderboard.length > 0
-    ? leaderboard.reduce((sum, e) => sum + e.totalReturn, 0) / leaderboard.length
-    : 0;
+  const handleSearch = (query: string) => {
+    setSearchQuery(query);
+    setPage(1);
+  };
+
+  const handleSort = (field: string, order: 'asc' | 'desc') => {
+    setSortBy(field as any);
+    setSortOrder(order);
+    setPage(1);
+  };
+
+  const handlePageChange = (newPage: number) => {
+    setPage(newPage);
+  };
+
+  const handleRowClick = (embedding: Embedding) => {
+    setSelectedEmbedding(embedding);
+  };
+
+  const handleFindSimilar = (embedding: Embedding) => {
+    setSearchQuery(embedding.metadata.date);
+    setSelectedEmbedding(null);
+  };
+
+  const handleStockSelect = (symbol: string) => {
+    setSelectedSymbol(symbol);
+    setViewMode('single');
+    setPage(1);
+  };
+
+  const handleMultipleSelect = (symbols: string[]) => {
+    setSelectedSymbols(symbols);
+    if (symbols.length > 1) {
+      setViewMode('compare');
+    } else if (symbols.length === 1) {
+      setSelectedSymbol(symbols[0]);
+      setViewMode('single');
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -214,42 +148,44 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
-              Total AUM
+              Selected Stock
             </CardTitle>
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-mono font-bold">
-              ${totalValue.toLocaleString()}
+              {selectedSymbol || '-'}
             </p>
           </CardContent>
         </Card>
-        
+
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
-              Avg Return
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className={`text-2xl font-mono font-bold ${avgReturn >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-              {avgReturn >= 0 ? '+' : ''}{(avgReturn * 100).toFixed(2)}%
-            </p>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-muted-foreground">
-              Active Managers
+              Data Points
             </CardTitle>
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-mono font-bold">
-              {leaderboard.length}
+              {stats ? stats.totalCount.toLocaleString() : '...'}
             </p>
           </CardContent>
         </Card>
-        
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground">
+              Date Range
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm font-mono">
+              {stats && stats.dateRange[0]
+                ? `${stats.dateRange[0]} to ${stats.dateRange[1]}`
+                : '...'}
+            </p>
+          </CardContent>
+        </Card>
+
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm text-muted-foreground">
@@ -257,61 +193,158 @@ export default function Dashboard() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <Badge 
-              variant="outline" 
-              className={isLive 
-                ? 'bg-green-500/20 text-green-500' 
-                : 'bg-yellow-500/20 text-yellow-500'
+            <Badge
+              variant="outline"
+              className={
+                isLive
+                  ? 'bg-green-500/20 text-green-500'
+                  : 'bg-red-500/20 text-red-500'
               }
             >
-              {isLive ? '● Live' : '○ Demo Mode'}
+              {isLive ? '● Connected' : '○ Disconnected'}
             </Badge>
           </CardContent>
         </Card>
       </div>
 
-      {/* Main Content Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Leaderboard - Full width on mobile, 2 cols on desktop */}
-        <div className="lg:col-span-2">
-          <Leaderboard 
-            entries={leaderboard}
-            onSelectManager={(id) => {
-              window.location.href = `/managers/${id}`;
-            }}
-          />
+      {/* Main Content */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        {/* Stock Selector - Left sidebar */}
+        <div className="lg:col-span-1">
+          <Tabs value={viewMode} onValueChange={(v) => setViewMode(v as any)}>
+            <TabsList className="grid w-full grid-cols-2 mb-4">
+              <TabsTrigger value="single">Single</TabsTrigger>
+              <TabsTrigger value="compare">Compare</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="single">
+              <StockSelector
+                onSelectStock={handleStockSelect}
+                selectedSymbol={selectedSymbol}
+              />
+            </TabsContent>
+
+            <TabsContent value="compare">
+              <StockSelector
+                onSelectMultiple={handleMultipleSelect}
+                selectedSymbols={selectedSymbols}
+                multiSelect={true}
+              />
+            </TabsContent>
+          </Tabs>
         </div>
-        
-        {/* Signals Panel */}
-        <div>
-          <SignalDisplay signals={signals} />
+
+        {/* Main Content Area */}
+        <div className="lg:col-span-3 space-y-6">
+          {viewMode === 'compare' && selectedSymbols.length > 0 ? (
+            <MultiStockCompare symbols={selectedSymbols} />
+          ) : selectedSymbol ? (
+            <>
+              {/* Search Bar */}
+              <Card>
+                <CardHeader>
+                  <CardTitle>Semantic Market Search</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <SearchBar onSearch={handleSearch} isLoading={isLoading} />
+                  {searchInterpretation && (
+                    <div className="mt-3 p-3 bg-muted rounded-lg">
+                      <p className="text-sm">
+                        <span className="font-semibold">
+                          Search interpretation:
+                        </span>{' '}
+                        {searchInterpretation}
+                      </p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Data Display */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="lg:col-span-2">
+                  <Card>
+                    <CardHeader>
+                      <div className="flex items-center justify-between">
+                        <CardTitle>Market State Embeddings</CardTitle>
+                        <div className="text-sm text-muted-foreground">
+                          {total.toLocaleString()} results
+                        </div>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <Tabs
+                        value={activeTab}
+                        onValueChange={(v) => setActiveTab(v as any)}
+                      >
+                        <TabsList className="grid w-full grid-cols-2">
+                          <TabsTrigger value="table">Table View</TabsTrigger>
+                          <TabsTrigger value="timeline">
+                            Timeline View
+                          </TabsTrigger>
+                        </TabsList>
+
+                        <TabsContent value="table" className="mt-4">
+                          <EmbeddingsTable
+                            embeddings={embeddings}
+                            total={total}
+                            page={page}
+                            perPage={perPage}
+                            onPageChange={handlePageChange}
+                            onSort={handleSort}
+                            onRowClick={handleRowClick}
+                            sortBy={sortBy}
+                            sortOrder={sortOrder}
+                            isLoading={isLoading}
+                          />
+                        </TabsContent>
+
+                        <TabsContent value="timeline" className="mt-4">
+                          <EmbeddingsTimeline
+                            embeddings={embeddings}
+                            onPointClick={handleRowClick}
+                          />
+                        </TabsContent>
+                      </Tabs>
+                    </CardContent>
+                  </Card>
+                </div>
+
+                {/* Detail Panel */}
+                <div>
+                  {selectedEmbedding ? (
+                    <EmbeddingDetail
+                      embedding={selectedEmbedding}
+                      onClose={() => setSelectedEmbedding(null)}
+                      onFindSimilar={handleFindSimilar}
+                    />
+                  ) : (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Details</CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <p className="text-sm text-muted-foreground">
+                          Click on any row in the table or point in the
+                          timeline to view detailed market state information.
+                        </p>
+                      </CardContent>
+                    </Card>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <Card>
+              <CardContent className="py-12">
+                <div className="text-center text-muted-foreground">
+                  Select a stock from the sidebar to view embeddings data
+                </div>
+              </CardContent>
+            </Card>
+          )}
         </div>
       </div>
-
-      {/* Performance Chart */}
-      <PortfolioChart snapshots={snapshots} managerNames={managerNames} />
-
-      {/* Manager Cards */}
-      <div>
-        <h2 className="text-lg font-semibold mb-4">Portfolio Managers</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {leaderboard.map((entry) => (
-            <ManagerCard
-              key={entry.manager.id}
-              manager={entry.manager}
-              portfolio={entry.portfolio}
-              sharpeRatio={entry.sharpeRatio}
-              totalReturn={entry.totalReturn}
-              onClick={() => {
-                window.location.href = `/managers/${entry.manager.id}`;
-              }}
-            />
-          ))}
-        </div>
-      </div>
-
-      {/* Recent Trades */}
-      <TradeHistory trades={trades} managerNames={managerNames} />
     </div>
   );
 }

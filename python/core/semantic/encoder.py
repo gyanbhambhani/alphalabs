@@ -178,8 +178,12 @@ class MarketStateEncoder:
         if len(volume) >= 21:
             # Volume relative to 20-day average
             vol_avg = volume.iloc[-21:-1].mean()
-            if vol_avg > 0:
-                vol_ratio = volume.iloc[-1] / vol_avg
+            current_vol = volume.iloc[-1]
+            
+            if vol_avg > 0 and current_vol > 0:
+                vol_ratio = current_vol / vol_avg
+                # Clamp ratio to avoid extreme values
+                vol_ratio = np.clip(vol_ratio, 0.01, 100.0)
                 features.append(np.log1p(vol_ratio - 1))  # log-scaled
             else:
                 features.append(0.0)
@@ -187,16 +191,16 @@ class MarketStateEncoder:
             # Volume trend (5-day vs 20-day)
             vol_5 = volume.iloc[-5:].mean()
             vol_20 = volume.iloc[-20:].mean()
-            if vol_20 > 0:
-                vol_trend = vol_5 / vol_20 - 1
+            if vol_20 > 0 and vol_5 > 0:
+                vol_trend = np.clip(vol_5 / vol_20 - 1, -0.99, 10.0)
                 features.append(vol_trend)
             else:
                 features.append(0.0)
             
             # Volume spike indicator
             vol_std = volume.iloc[-21:-1].std()
-            if vol_std > 0:
-                vol_zscore = (volume.iloc[-1] - vol_avg) / vol_std
+            if vol_std > 0 and not np.isnan(vol_avg):
+                vol_zscore = (current_vol - vol_avg) / vol_std
                 features.append(np.tanh(vol_zscore / 2))  # bounded
             else:
                 features.append(0.0)
@@ -322,6 +326,9 @@ class MarketStateEncoder:
             regime
         ])
         
+        # Replace any NaN or inf values with 0
+        base_vector = np.nan_to_num(base_vector, nan=0.0, posinf=0.0, neginf=0.0)
+        
         # Ensure correct dimension
         if len(base_vector) < self.TOTAL_DIMS:
             base_vector = np.pad(
@@ -334,10 +341,16 @@ class MarketStateEncoder:
         # Project to output dimensions
         vector = np.dot(base_vector, self.projection_matrix)
         
+        # Replace any NaN or inf values from projection
+        vector = np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0)
+        
         # L2 normalize
         norm = np.linalg.norm(vector)
-        if norm > 0:
+        if norm > 1e-10:  # More robust zero check
             vector = vector / norm
+        else:
+            # If vector is all zeros or near-zeros, use uniform distribution
+            vector = np.ones(self.OUTPUT_DIMS) / np.sqrt(self.OUTPUT_DIMS)
         
         # Metadata for interpretability (flattened for ChromaDB)
         metadata = {

@@ -151,3 +151,31 @@ class MarketData(Base):
     __table_args__ = (
         Index("idx_market_data_symbol_ts", "symbol", "timestamp", unique=True),
     )
+
+
+class Stock(Base):
+    """S&P 500 stock metadata"""
+    __tablename__ = "stocks"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), unique=True, nullable=False)
+    name = Column(String(200), nullable=False)
+    sector = Column(String(100), nullable=True)
+    sub_industry = Column(String(200), nullable=True)
+    headquarters = Column(String(200), nullable=True)
+    date_added = Column(String(50), nullable=True)
+    cik = Column(String(20), nullable=True)
+    founded = Column(String(100), nullable=True)
+    
+    # Embedding metadata
+    has_embeddings = Column(Boolean, default=False)
+    embeddings_count = Column(Integer, default=0)
+    embeddings_date_range_start = Column(String(20), nullable=True)
+    embeddings_date_range_end = Column(String(20), nullable=True)
+    last_updated = Column(DateTime, default=datetime.utcnow, 
+                         onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index("idx_stocks_symbol", "symbol"),
+        Index("idx_stocks_sector", "sector"),
+    )

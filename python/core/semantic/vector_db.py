@@ -30,6 +30,7 @@ class VectorDatabase:
     - Adding market states with metadata
     - Semantic search for similar periods
     - Batch operations for efficiency
+    - Multiple collections (one per stock symbol)
     """
     
     COLLECTION_NAME = "market_states"
@@ -37,7 +38,8 @@ class VectorDatabase:
     def __init__(
         self,
         persist_directory: str = "./chroma_data",
-        in_memory: bool = False
+        in_memory: bool = False,
+        symbol: Optional[str] = None
     ):
         """
         Initialize the vector database.
@@ -45,6 +47,7 @@ class VectorDatabase:
         Args:
             persist_directory: Where to store persistent data
             in_memory: If True, use in-memory storage (for testing)
+            symbol: Stock symbol for this collection (None = default "market_states")
         """
         if in_memory:
             self.client = chromadb.Client()
@@ -52,9 +55,16 @@ class VectorDatabase:
             Path(persist_directory).mkdir(parents=True, exist_ok=True)
             self.client = chromadb.PersistentClient(path=persist_directory)
         
+        # Determine collection name
+        self.symbol = symbol
+        if symbol:
+            collection_name = f"market_states_{symbol.upper()}"
+        else:
+            collection_name = self.COLLECTION_NAME
+        
         # Get or create collection
         self.collection = self.client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+            name=collection_name,
             metadata={"hnsw:space": "cosine"}  # Use cosine similarity
         )
     
@@ -175,3 +185,69 @@ class VectorDatabase:
         
         dates = sorted(all_data['ids'])
         return (dates[0], dates[-1])
+    
+    @classmethod
+    def list_all_collections(
+        cls,
+        persist_directory: str = "./chroma_data"
+    ) -> List[str]:
+        """
+        List all collections in the database.
+        
+        Args:
+            persist_directory: Where data is stored
+            
+        Returns:
+            List of collection names
+        """
+        client = chromadb.PersistentClient(path=persist_directory)
+        collections = client.list_collections()
+        return [col.name for col in collections]
+    
+    @classmethod
+    def get_all_symbols(
+        cls,
+        persist_directory: str = "./chroma_data"
+    ) -> List[str]:
+        """
+        Get list of all stock symbols with embeddings.
+        
+        Args:
+            persist_directory: Where data is stored
+            
+        Returns:
+            List of stock symbols
+        """
+        collections = cls.list_all_collections(persist_directory)
+        symbols = []
+        
+        for col_name in collections:
+            if col_name.startswith("market_states_"):
+                symbol = col_name.replace("market_states_", "")
+                symbols.append(symbol)
+        
+        return sorted(symbols)
+    
+    @classmethod
+    def delete_collection(
+        cls,
+        symbol: str,
+        persist_directory: str = "./chroma_data"
+    ) -> bool:
+        """
+        Delete a specific stock's collection.
+        
+        Args:
+            symbol: Stock symbol
+            persist_directory: Where data is stored
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            client = chromadb.PersistentClient(path=persist_directory)
+            collection_name = f"market_states_{symbol.upper()}"
+            client.delete_collection(name=collection_name)
+            return True
+        except Exception:
+            return False

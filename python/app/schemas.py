@@ -186,3 +186,94 @@ class ManagerDecisions(BaseModel):
     manager_id: str
     decisions: list[TradingDecision]
     timestamp: datetime
+
+
+# Embedding schemas
+class EmbeddingMetadata(BaseModel):
+    date: str
+    return_1w: float = Field(alias="return1w")
+    return_1m: float = Field(alias="return1m")
+    return_3m: float = Field(alias="return3m")
+    return_6m: float = Field(alias="return6m")
+    return_12m: float = Field(alias="return12m")
+    volatility_5d: float = Field(alias="volatility5d")
+    volatility_10d: float = Field(alias="volatility10d")
+    volatility_21d: float = Field(alias="volatility21d")
+    volatility_63d: float = Field(alias="volatility63d")
+    price: float
+    
+    class Config:
+        populate_by_name = True
+
+
+class EmbeddingResponse(BaseModel):
+    id: str
+    metadata: EmbeddingMetadata
+
+
+class EmbeddingSearchQuery(BaseModel):
+    query: str
+    top_k: int = Field(default=20, ge=1, le=100)
+
+
+class EmbeddingSearchResult(EmbeddingResponse):
+    similarity: float
+    query_interpretation: Optional[str] = Field(
+        alias="queryInterpretation", 
+        default=None
+    )
+    
+    class Config:
+        populate_by_name = True
+
+
+class EmbeddingsStatsResponse(BaseModel):
+    total_count: int = Field(alias="totalCount")
+    date_range: tuple[str, str] = Field(alias="dateRange")
+    avg_return_1m: float = Field(alias="avgReturn1m")
+    avg_volatility_21d: float = Field(alias="avgVolatility21d")
+    
+    class Config:
+        populate_by_name = True
+
+
+class EmbeddingsListResponse(BaseModel):
+    embeddings: list[EmbeddingResponse]
+    total: int
+    page: int
+    per_page: int = Field(alias="perPage")
+    
+    class Config:
+        populate_by_name = True
+
+
+# Stock schemas
+class StockResponse(BaseModel):
+    symbol: str
+    name: str
+    sector: Optional[str] = None
+    sub_industry: Optional[str] = Field(alias="subIndustry", default=None)
+    headquarters: Optional[str] = None
+    has_embeddings: bool = Field(alias="hasEmbeddings")
+    embeddings_count: int = Field(alias="embeddingsCount", default=0)
+    embeddings_date_range_start: Optional[str] = Field(
+        alias="embeddingsDateRangeStart", 
+        default=None
+    )
+    embeddings_date_range_end: Optional[str] = Field(
+        alias="embeddingsDateRangeEnd", 
+        default=None
+    )
+    
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+
+class StocksListResponse(BaseModel):
+    stocks: list[StockResponse]
+    total: int
+    sectors: list[str]
+    
+    class Config:
+        populate_by_name = True

@@ -152,3 +152,67 @@ export interface ApiResponse<T> {
   data?: T;
   error?: string;
 }
+
+// Embedding types
+export interface EmbeddingMetadata {
+  date: string;
+  return1w: number;
+  return1m: number;
+  return3m: number;
+  return6m: number;
+  return12m: number;
+  volatility5d: number;
+  volatility10d: number;
+  volatility21d: number;
+  volatility63d: number;
+  price: number;
+}
+
+export interface Embedding {
+  id: string;
+  metadata: EmbeddingMetadata;
+}
+
+export interface EmbeddingSearchResult extends Embedding {
+  similarity: number;
+  queryInterpretation?: string;
+}
+
+export interface EmbeddingsStats {
+  totalCount: number;
+  dateRange: [string, string];
+  avgReturn1m: number;
+  avgVolatility21d: number;
+}
+
+export interface EmbeddingsListResponse {
+  embeddings: Embedding[];
+  total: number;
+  page: number;
+  perPage: number;
+}
+
+export interface EmbeddingSearchResponse {
+  results: EmbeddingSearchResult[];
+  interpretation: string;
+  total: number;
+}
+
+// Stock types
+export interface Stock {
+  symbol: string;
+  name: string;
+  sector: string | null;
+  subIndustry: string | null;
+  headquarters: string | null;
+  hasEmbeddings: boolean;
+  embeddingsCount: number;
+  embeddingsDateRangeStart: string | null;
+  embeddingsDateRangeEnd: string | null;
+}
+
+export interface StocksListResponse {
+  stocks: Stock[];
+  total: number;
+  sectors: string[];
+}
