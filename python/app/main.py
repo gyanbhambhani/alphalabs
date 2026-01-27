@@ -1109,73 +1109,92 @@ from pydantic import Field
 
 class FundResponse(BaseModel):
     """Fund summary response"""
-    fund_id: str
+    fund_id: str = Field(serialization_alias="fundId")
     name: str
     strategy: str
     description: Optional[str] = None
-    total_value: float
-    cash_balance: float
-    gross_exposure: float
-    net_exposure: float
-    n_positions: int
-    is_active: bool
+    total_value: float = Field(serialization_alias="totalValue")
+    cash_balance: float = Field(serialization_alias="cashBalance")
+    gross_exposure: float = Field(serialization_alias="grossExposure")
+    net_exposure: float = Field(serialization_alias="netExposure")
+    n_positions: int = Field(serialization_alias="nPositions")
+    is_active: bool = Field(serialization_alias="isActive")
     
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 class FundDetailResponse(FundResponse):
     """Detailed fund response including thesis and policy"""
     thesis: Optional[dict] = None
     policy: Optional[dict] = None
-    risk_limits: Optional[dict] = None
+    risk_limits: Optional[dict] = Field(serialization_alias="riskLimits", default=None)
 
 
 class FundPositionResponse(BaseModel):
     """Fund position response"""
     symbol: str
     quantity: float
-    avg_entry_price: float
-    current_price: float
-    market_value: float
-    unrealized_pnl: float
-    weight_pct: float
+    avg_entry_price: float = Field(serialization_alias="avgEntryPrice")
+    current_price: float = Field(serialization_alias="currentPrice")
+    market_value: float = Field(serialization_alias="marketValue")
+    unrealized_pnl: float = Field(serialization_alias="unrealizedPnl")
+    weight_pct: float = Field(serialization_alias="weightPct")
+    
+    model_config = {"populate_by_name": True}
 
 
 class DecisionResponse(BaseModel):
     """Decision record response"""
-    decision_id: str
-    fund_id: str
-    asof_timestamp: str
-    decision_type: str
+    decision_id: str = Field(serialization_alias="decisionId")
+    fund_id: str = Field(serialization_alias="fundId")
+    asof_timestamp: str = Field(serialization_alias="asofTimestamp")
+    decision_type: str = Field(serialization_alias="decisionType")
     status: str
-    no_trade_reason: Optional[str] = None
-    universe_hash: Optional[str] = None
-    inputs_hash: Optional[str] = None
-    predicted_directions: Optional[dict] = None
-    expected_return: Optional[float] = None
+    no_trade_reason: Optional[str] = Field(
+        serialization_alias="noTradeReason", default=None
+    )
+    universe_hash: Optional[str] = Field(
+        serialization_alias="universeHash", default=None
+    )
+    inputs_hash: Optional[str] = Field(
+        serialization_alias="inputsHash", default=None
+    )
+    predicted_directions: Optional[dict] = Field(
+        serialization_alias="predictedDirections", default=None
+    )
+    expected_return: Optional[float] = Field(
+        serialization_alias="expectedReturn", default=None
+    )
+    
+    model_config = {"populate_by_name": True}
 
 
 class DebateResponse(BaseModel):
     """Debate transcript summary response"""
-    transcript_id: str
-    fund_id: str
-    started_at: str
-    completed_at: Optional[str] = None
-    num_proposals: int
-    num_critiques: int
-    final_consensus_level: float
+    transcript_id: str = Field(serialization_alias="transcriptId")
+    fund_id: str = Field(serialization_alias="fundId")
+    started_at: str = Field(serialization_alias="startedAt")
+    completed_at: Optional[str] = Field(
+        serialization_alias="completedAt", default=None
+    )
+    num_proposals: int = Field(serialization_alias="numProposals")
+    num_critiques: int = Field(serialization_alias="numCritiques")
+    final_consensus_level: float = Field(serialization_alias="finalConsensusLevel")
+    
+    model_config = {"populate_by_name": True}
 
 
 class FundLeaderboardEntry(BaseModel):
     """Fund leaderboard entry"""
     rank: int
-    fund_id: str
+    fund_id: str = Field(serialization_alias="fundId")
     name: str
     strategy: str
-    total_value: float
-    gross_exposure: float
-    is_active: bool
+    total_value: float = Field(serialization_alias="totalValue")
+    gross_exposure: float = Field(serialization_alias="grossExposure")
+    is_active: bool = Field(serialization_alias="isActive")
+    
+    model_config = {"populate_by_name": True}
 
 
 @app.get("/api/funds", response_model=list[FundResponse])
