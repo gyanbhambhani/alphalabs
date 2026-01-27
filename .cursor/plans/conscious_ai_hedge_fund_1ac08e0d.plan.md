@@ -4,28 +4,28 @@ overview: Transform the trading system into a depth-driven "conscious" AI hedge 
 todos:
   - id: market-context-provider
     content: Build MarketContextProvider with deep historical narratives and geopolitical context
-    status: pending
+    status: completed
   - id: quant-models
     content: Implement quantitative models (Black-Scholes, Sharpe, portfolio optimization)
-    status: pending
+    status: completed
   - id: decision-logger
     content: Create decision logging system with full consciousness tracking
-    status: pending
+    status: completed
   - id: enhanced-llm-prompts
     content: Rewrite LLM manager prompts for narrative-style deep reasoning
-    status: pending
+    status: completed
   - id: external-data-provider
     content: Build hybrid external data provider (facts from APIs, interpretation from LLMs)
-    status: pending
+    status: completed
   - id: chat-backend
     content: Implement Trading Lab chat backend with semantic query parsing
-    status: pending
+    status: completed
   - id: trading-lab-ui
     content: Create split-screen Trading Lab interface (chat + live dashboard)
-    status: pending
+    status: completed
   - id: research-engine
     content: Build research query engine for generating AI-powered market reports
-    status: pending
+    status: completed
 isProject: false
 ---
 

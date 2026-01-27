@@ -6,7 +6,7 @@ for strategy selection.
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -28,7 +28,7 @@ class VolatilityRegime:
     level: VolatilityLevel
     trend: TrendDirection
     realized_vol: float  # Annualized
-    vix: float | None
+    vix: Optional[float]
     regime_name: str
     
     @property
@@ -128,7 +128,7 @@ def classify_volatility_level(
 
 def detect_volatility_regime(
     prices: pd.Series,
-    vix: float | None = None,
+    vix: Optional[float] = None,
     vol_window: int = 20,
     trend_short_window: int = 50,
     trend_long_window: int = 200,

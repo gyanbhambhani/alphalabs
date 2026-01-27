@@ -179,3 +179,268 @@ class Stock(Base):
         Index("idx_stocks_symbol", "symbol"),
         Index("idx_stocks_sector", "sector"),
     )
+
+
+# ============================================================================
+# NEW: Fund-based trading models (Collaborative AI Funds)
+# ============================================================================
+
+class FundModel(Base):
+    """Thesis-driven fund where AI models collaborate."""
+    __tablename__ = "funds"
+    
+    id = Column(String(50), primary_key=True)
+    name = Column(String(100), nullable=False)
+    strategy = Column(String(50), nullable=False)  # trend_macro, mean_reversion, etc.
+    description = Column(Text, nullable=True)
+    
+    # Configuration stored as JSON
+    thesis_json = Column(JSON, nullable=True)
+    policy_json = Column(JSON, nullable=True)
+    pm_config_json = Column(JSON, nullable=True)
+    risk_limits_json = Column(JSON, nullable=True)
+    baseline_policy_json = Column(JSON, nullable=True)
+    
+    # Portfolio state
+    cash_balance = Column(DECIMAL(18, 2), nullable=False, default=100000)
+    total_value = Column(DECIMAL(18, 2), nullable=False, default=100000)
+    
+    # Status
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    positions = relationship("FundPosition", back_populates="fund")
+    decisions = relationship("DecisionRecordModel", back_populates="fund")
+    risk_state = relationship(
+        "FundRiskStateModel", back_populates="fund", uselist=False
+    )
+    
+    __table_args__ = (
+        Index("idx_funds_strategy", "strategy"),
+    )
+
+
+class FundPosition(Base):
+    """Position held by a fund."""
+    __tablename__ = "fund_positions"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fund_id = Column(String(50), ForeignKey("funds.id"), nullable=False)
+    symbol = Column(String(10), nullable=False)
+    quantity = Column(DECIMAL(18, 8), nullable=False)
+    avg_entry_price = Column(DECIMAL(18, 8), nullable=False)
+    current_price = Column(DECIMAL(18, 8), nullable=True)
+    unrealized_pnl = Column(DECIMAL(18, 8), nullable=True)
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    fund = relationship("FundModel", back_populates="positions")
+    
+    __table_args__ = (
+        Index("idx_fund_positions_fund_symbol", "fund_id", "symbol", unique=True),
+    )
+
+
+class DecisionRecordModel(Base):
+    """Structured decision record for audit trail."""
+    __tablename__ = "decision_records"
+    
+    id = Column(String(50), primary_key=True)
+    fund_id = Column(String(50), ForeignKey("funds.id"), nullable=False)
+    snapshot_id = Column(String(50), nullable=False)
+    asof_timestamp = Column(DateTime, nullable=False)
+    
+    # Idempotency
+    idempotency_key = Column(String(32), unique=True, nullable=False)
+    run_context = Column(String(20), nullable=False)  # backtest, paper, live
+    decision_window_start = Column(DateTime, nullable=False)
+    
+    # Decision outcome
+    decision_type = Column(String(20), nullable=False)  # trade, no_trade
+    no_trade_reason = Column(String(30), nullable=True)
+    
+    # Lifecycle
+    status = Column(String(30), nullable=False)
+    status_history_json = Column(JSON, nullable=True)
+    
+    # Intent and risk
+    intent_json = Column(JSON, nullable=True)
+    risk_result_json = Column(JSON, nullable=True)
+    
+    # Context for audit
+    snapshot_quality_json = Column(JSON, nullable=True)
+    universe_result_json = Column(JSON, nullable=True)
+    
+    # Reproducibility hashes
+    universe_hash = Column(String(20), nullable=True)
+    inputs_hash = Column(String(20), nullable=True)  # includes pm_prompt_hash
+    
+    # Model tracking
+    model_versions_json = Column(JSON, nullable=True)
+    prompt_hashes_json = Column(JSON, nullable=True)
+    
+    # Predictions for eval
+    predicted_directions_json = Column(JSON, nullable=True)
+    expected_return = Column(Float, nullable=True)
+    expected_holding_days = Column(Integer, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    fund = relationship("FundModel", back_populates="decisions")
+    transcript = relationship(
+        "DebateTranscriptModel", back_populates="decision", uselist=False
+    )
+    outcomes = relationship("TradeOutcome", back_populates="decision")
+    
+    __table_args__ = (
+        Index("idx_decisions_fund", "fund_id"),
+        Index("idx_decisions_timestamp", "asof_timestamp"),
+        Index("idx_decisions_idempotency", "idempotency_key"),
+    )
+
+
+class DebateTranscriptModel(Base):
+    """Raw debate transcript for humans and debugging."""
+    __tablename__ = "debate_transcripts"
+    
+    id = Column(String(50), primary_key=True)
+    decision_id = Column(
+        String(50), ForeignKey("decision_records.id"), nullable=True
+    )
+    fund_id = Column(String(50), nullable=False)
+    snapshot_id = Column(String(50), nullable=False)
+    
+    started_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    
+    # Messages stored as JSON array
+    messages_json = Column(JSON, nullable=True)
+    
+    # Summary stats
+    num_proposals = Column(Integer, default=0)
+    num_critiques = Column(Integer, default=0)
+    final_consensus_level = Column(Float, nullable=True)
+    
+    # Token tracking
+    total_input_tokens = Column(Integer, default=0)
+    total_output_tokens = Column(Integer, default=0)
+    
+    # Relationships
+    decision = relationship("DecisionRecordModel", back_populates="transcript")
+    
+    __table_args__ = (
+        Index("idx_transcripts_fund", "fund_id"),
+        Index("idx_transcripts_timestamp", "started_at"),
+    )
+
+
+class TradeOutcome(Base):
+    """Trade-level outcome for evaluation."""
+    __tablename__ = "trade_outcomes"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    decision_id = Column(
+        String(50), ForeignKey("decision_records.id"), nullable=False
+    )
+    fund_id = Column(String(50), nullable=False)
+    
+    # Trade details
+    symbol = Column(String(10), nullable=False)
+    direction = Column(String(10), nullable=False)  # long, short
+    entry_price = Column(DECIMAL(18, 8), nullable=False)
+    entry_timestamp = Column(DateTime, nullable=False)
+    entry_weight = Column(Float, nullable=True)
+    
+    # Exit details (filled after close)
+    exit_price = Column(DECIMAL(18, 8), nullable=True)
+    exit_timestamp = Column(DateTime, nullable=True)
+    exit_reason = Column(String(50), nullable=True)  # stop_loss, take_profit, manual
+    
+    # Outcome metrics
+    realized_return = Column(Float, nullable=True)  # % return
+    realized_pnl = Column(DECIMAL(18, 8), nullable=True)  # Dollar P&L
+    holding_days = Column(Integer, nullable=True)
+    slippage_bps = Column(Float, nullable=True)
+    
+    # Prediction tracking (for calibration)
+    predicted_direction = Column(String(10), nullable=True)  # up, down
+    predicted_confidence = Column(Float, nullable=True)
+    was_correct = Column(Boolean, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    decision = relationship("DecisionRecordModel", back_populates="outcomes")
+    
+    __table_args__ = (
+        Index("idx_outcomes_fund", "fund_id"),
+        Index("idx_outcomes_symbol", "symbol"),
+        Index("idx_outcomes_entry", "entry_timestamp"),
+    )
+
+
+class FundRiskStateModel(Base):
+    """Risk state tracking for funds (cooldowns, P&L)."""
+    __tablename__ = "fund_risk_states"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fund_id = Column(
+        String(50), ForeignKey("funds.id"), unique=True, nullable=False
+    )
+    
+    # Cooldown tracking
+    risk_off_until = Column(DateTime, nullable=True)
+    last_breach_reason = Column(String(50), nullable=True)
+    last_breach_time = Column(DateTime, nullable=True)
+    
+    # P&L tracking for circuit breakers
+    current_daily_pnl_pct = Column(Float, default=0.0)
+    current_weekly_drawdown_pct = Column(Float, default=0.0)
+    peak_nav = Column(DECIMAL(18, 2), nullable=True)
+    
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    fund = relationship("FundModel", back_populates="risk_state")
+
+
+class FundDailySnapshot(Base):
+    """Daily performance snapshot for funds."""
+    __tablename__ = "fund_daily_snapshots"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fund_id = Column(String(50), ForeignKey("funds.id"), nullable=False)
+    date = Column(Date, nullable=False)
+    
+    # Performance
+    portfolio_value = Column(DECIMAL(18, 2), nullable=False)
+    daily_return = Column(Float, nullable=True)
+    cumulative_return = Column(Float, nullable=True)
+    
+    # Risk metrics
+    volatility_21d = Column(Float, nullable=True)
+    sharpe_21d = Column(Float, nullable=True)
+    max_drawdown = Column(Float, nullable=True)
+    
+    # Trade stats
+    n_positions = Column(Integer, default=0)
+    gross_exposure = Column(Float, nullable=True)
+    net_exposure = Column(Float, nullable=True)
+    
+    # Eval metrics
+    n_trades = Column(Integer, default=0)
+    hit_rate = Column(Float, nullable=True)
+    avg_holding_days = Column(Float, nullable=True)
+    turnover = Column(Float, nullable=True)
+    
+    __table_args__ = (
+        Index(
+            "idx_fund_snapshots_fund_date", "fund_id", "date", unique=True
+        ),
+    )

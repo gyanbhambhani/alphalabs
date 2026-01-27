@@ -7,6 +7,9 @@ from db.database import (
     get_async_session, get_db
 )
 
+# Import DecisionLogModel from logging module (it uses Base from here)
+# Note: This is imported late to avoid circular imports
+
 __all__ = [
     "Base", "Manager", "Portfolio", "Position", "Trade",
     "DailySnapshot", "SignalSnapshot", "MarketData", "Stock",

@@ -153,6 +153,7 @@ class StrategySignals(BaseModel):
     volatility_regime: str = Field(alias="volatilityRegime")
     semantic_search: SemanticSearchResult = Field(alias="semanticSearch")
     timestamp: datetime
+    data_freshness: str = Field(alias="dataFreshness", default="unknown")
     
     class Config:
         populate_by_name = True

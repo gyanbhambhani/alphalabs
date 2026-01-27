@@ -1,222 +1,445 @@
 """
-Risk Manager
+Risk Manager - Multi-stage risk checking with explicit violations.
 
-Enforces risk limits and position sizing rules.
+Key principles:
+- 3-stage checking: pre-trade (intent), order-level, post-fill
+- RiskCheckResult with scale_factor and detailed violations
+- Quantity-based go_flat (no stale prices)
+- Uses FundRiskStateRepo for cooldown tracking
 """
-from typing import List, Dict, Optional
-from dataclasses import dataclass
-from core.managers.base import TradingDecision, Action, Portfolio, RiskLimits
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
+
+from core.config.constants import CONSTANTS
+from core.execution.risk_repo import FundRiskState, FundRiskStateRepo
+
+if TYPE_CHECKING:
+    from core.funds.fund import Fund, FundPortfolio
+    from core.execution.intent import PortfolioIntent, Order
+
+
+@dataclass
+class RiskViolation:
+    """A specific risk rule violation."""
+    rule_name: str
+    symbol: Optional[str]  # None for portfolio-level rules
+    limit: float
+    actual: float
+    severity: str  # "warning", "scale", "veto"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rule_name": self.rule_name,
+            "symbol": self.symbol,
+            "limit": self.limit,
+            "actual": self.actual,
+            "severity": self.severity,
+        }
 
 
 @dataclass
 class RiskCheckResult:
-    """Result of a risk check"""
-    approved: bool
+    """
+    Result of risk check with explicit details.
+    
+    Status can be:
+    - "approved": Trade as proposed
+    - "scaled": Trade with reduced sizes
+    - "vetoed": No trade allowed
+    """
+    status: str  # "approved", "scaled", "vetoed"
+    scale_factor: float  # 1.0 for approved, <1.0 for scaled, 0.0 for vetoed
+    per_symbol_scales: Dict[str, float] = field(default_factory=dict)
+    violations: List[RiskViolation] = field(default_factory=list)
+    applied_rules: List[str] = field(default_factory=list)
     reason: Optional[str] = None
-    modified_decision: Optional[TradingDecision] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "scale_factor": self.scale_factor,
+            "per_symbol_scales": self.per_symbol_scales,
+            "violations": [v.to_dict() for v in self.violations],
+            "applied_rules": self.applied_rules,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class CloseOrder:
+    """
+    Quantity-based close order - no price needed.
+    
+    This is the fix for stale prices in go_flat.
+    Uses current quantity for market close.
+    """
+    symbol: str
+    quantity: float  # Positive = shares to close
+    side: str  # "sell" for longs, "buy" for shorts (to close)
+    order_type: str = "market"
+    urgency: str = "immediate"
+    max_slippage_bps: int = CONSTANTS.risk.EMERGENCY_CLOSE_SLIPPAGE_BPS
+
+
+@dataclass
+class PostFillAction:
+    """Result of post-fill risk check."""
+    action: str  # "none", "halt", "go_flat"
+    reason: Optional[str] = None
+    close_orders: List[CloseOrder] = field(default_factory=list)
+
+
+@dataclass
+class Fill:
+    """A filled order."""
+    symbol: str
+    quantity: float
+    price: float
+    side: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
 class RiskManager:
     """
-    Risk management for trading decisions.
+    Multi-stage risk checking with repository pattern.
     
-    Enforces:
-    - Position size limits
-    - Sector concentration limits
-    - Daily loss limits
-    - Maximum drawdown alerts
-    - Portfolio heat (total risk)
+    Stages:
+    1. check_intent: Pre-trade validation of PortfolioIntent
+    2. check_orders: Validation of concrete orders before sending
+    3. check_post_fill: Post-execution validation, may trigger go_flat
     """
     
-    def __init__(
-        self,
-        limits: Optional[RiskLimits] = None,
-        global_exposure_limit: float = 0.80,
-        vix_halt_threshold: float = 35.0
-    ):
+    def __init__(self, risk_state_repo: FundRiskStateRepo):
         """
-        Initialize risk manager.
+        Initialize with risk state repository.
         
         Args:
-            limits: Risk limits configuration
-            global_exposure_limit: Max % of portfolio invested
-            vix_halt_threshold: VIX level that triggers trading halt
+            risk_state_repo: Repository for fund risk state (cooldowns, P&L)
         """
-        self.limits = limits or RiskLimits()
-        self.global_exposure_limit = global_exposure_limit
-        self.vix_halt_threshold = vix_halt_threshold
-        
-        # Track daily stats
-        self._daily_loss: Dict[str, float] = {}
-        self._trades_today: Dict[str, int] = {}
-        self._is_halted = False
+        self.risk_state_repo = risk_state_repo
     
-    def check_position_size(
+    def check_intent(
         self,
-        decision: TradingDecision,
-        portfolio: Portfolio
+        intent: "PortfolioIntent",
+        fund: "Fund",
+        current_portfolio: "FundPortfolio"
     ) -> RiskCheckResult:
-        """Check if position size is within limits"""
-        if decision.action == Action.HOLD:
-            return RiskCheckResult(approved=True)
+        """
+        Stage 1: Pre-trade validation of PortfolioIntent.
         
-        # For sells, always approve
-        if decision.action == Action.SELL:
-            return RiskCheckResult(approved=True)
+        Checks:
+        - Cooldown status
+        - Position size limits
+        - Gross exposure limits
+        - Cash buffer requirements
+        """
+        applied_rules: List[str] = []
+        violations: List[RiskViolation] = []
         
-        # For buys, check size limit
-        if decision.size > self.limits.max_position_size:
-            modified = TradingDecision(
-                action=decision.action,
-                symbol=decision.symbol,
-                size=self.limits.max_position_size,
-                reasoning=decision.reasoning + 
-                    f" [Size reduced from {decision.size:.0%} to "
-                    f"{self.limits.max_position_size:.0%}]",
-                confidence=decision.confidence,
-                signals_used=decision.signals_used
-            )
+        # Check cooldown first
+        risk_state = self.risk_state_repo.get(fund.fund_id)
+        if risk_state and risk_state.is_in_cooldown():
             return RiskCheckResult(
-                approved=True,
-                reason="Position size reduced to limit",
-                modified_decision=modified
+                status="vetoed",
+                scale_factor=0.0,
+                violations=[RiskViolation(
+                    rule_name="cooldown",
+                    symbol=None,
+                    limit=0,
+                    actual=0,
+                    severity="veto"
+                )],
+                applied_rules=["cooldown"],
+                reason=f"In cooldown until {risk_state.risk_off_until}"
             )
+        applied_rules.append("cooldown")
         
-        return RiskCheckResult(approved=True)
-    
-    def check_daily_loss(
-        self,
-        manager_id: str,
-        portfolio: Portfolio,
-        start_of_day_value: float
-    ) -> RiskCheckResult:
-        """Check if daily loss limit has been hit"""
-        current_value = portfolio.total_value
-        daily_return = (current_value - start_of_day_value) / start_of_day_value
-        
-        if daily_return < -self.limits.daily_loss_limit:
+        # Check exposure limits
+        valid, error = intent.validate_exposures(
+            fund.policy.max_gross_exposure,
+            fund.policy.min_cash_buffer
+        )
+        if not valid:
+            violations.append(RiskViolation(
+                rule_name="exposure_limit",
+                symbol=None,
+                limit=fund.policy.max_gross_exposure,
+                actual=sum(abs(p.target_weight) for p in intent.positions),
+                severity="veto"
+            ))
             return RiskCheckResult(
-                approved=False,
-                reason=f"Daily loss limit hit: {daily_return:.1%}"
+                status="vetoed",
+                scale_factor=0.0,
+                violations=violations,
+                applied_rules=applied_rules + ["exposure_limit"],
+                reason=error
             )
+        applied_rules.append("exposure_limit")
         
-        return RiskCheckResult(approved=True)
-    
-    def check_trade_count(
-        self,
-        manager_id: str
-    ) -> RiskCheckResult:
-        """Check if max trades per day reached"""
-        trades = self._trades_today.get(manager_id, 0)
+        # Check individual position limits
+        scale_factor = 1.0
+        per_symbol_scales: Dict[str, float] = {}
         
-        if trades >= self.limits.max_trades_per_day:
+        for pos in intent.positions:
+            if abs(pos.target_weight) > fund.risk_limits.max_position_pct:
+                violations.append(RiskViolation(
+                    rule_name="position_size",
+                    symbol=pos.symbol,
+                    limit=fund.risk_limits.max_position_pct,
+                    actual=abs(pos.target_weight),
+                    severity="scale"
+                ))
+                # Calculate scale to bring within limit
+                symbol_scale = fund.risk_limits.max_position_pct / abs(pos.target_weight)
+                per_symbol_scales[pos.symbol] = symbol_scale
+                scale_factor = min(scale_factor, symbol_scale)
+        applied_rules.append("position_size")
+        
+        # Check max positions
+        if len(intent.positions) > fund.policy.max_positions:
+            violations.append(RiskViolation(
+                rule_name="max_positions",
+                symbol=None,
+                limit=fund.policy.max_positions,
+                actual=len(intent.positions),
+                severity="warning"  # Warning only, not scaling
+            ))
+        applied_rules.append("max_positions")
+        
+        if violations and scale_factor < 1.0:
             return RiskCheckResult(
-                approved=False,
-                reason=f"Max trades per day ({self.limits.max_trades_per_day}) reached"
+                status="scaled",
+                scale_factor=scale_factor,
+                per_symbol_scales=per_symbol_scales,
+                violations=violations,
+                applied_rules=applied_rules,
+                reason="Position sizes scaled to comply with limits"
             )
         
-        return RiskCheckResult(approved=True)
+        if violations:
+            return RiskCheckResult(
+                status="approved",
+                scale_factor=1.0,
+                violations=violations,  # Warnings only
+                applied_rules=applied_rules,
+                reason=None
+            )
+        
+        return RiskCheckResult(
+            status="approved",
+            scale_factor=1.0,
+            violations=[],
+            applied_rules=applied_rules,
+            reason=None
+        )
     
-    def check_global_exposure(
+    def check_orders(
         self,
-        portfolios: Dict[str, Portfolio]
+        orders: List["Order"],
+        fund: "Fund",
+        current_portfolio: "FundPortfolio"
     ) -> RiskCheckResult:
-        """Check total exposure across all portfolios"""
-        total_invested = 0.0
-        total_value = 0.0
+        """
+        Stage 2: Validation of concrete orders before sending.
         
-        for portfolio in portfolios.values():
-            total_value += portfolio.total_value
-            for pos in portfolio.positions.values():
-                total_invested += pos.market_value
+        Orders can violate limits due to rounding or slippage.
+        """
+        violations: List[RiskViolation] = []
+        applied_rules: List[str] = []
         
-        if total_value > 0:
-            exposure = total_invested / total_value
-            if exposure > self.global_exposure_limit:
-                return RiskCheckResult(
-                    approved=False,
-                    reason=f"Global exposure {exposure:.0%} exceeds "
-                           f"limit {self.global_exposure_limit:.0%}"
+        portfolio_value = current_portfolio.total_value
+        if portfolio_value <= 0:
+            return RiskCheckResult(
+                status="vetoed",
+                scale_factor=0.0,
+                violations=[RiskViolation(
+                    rule_name="portfolio_value",
+                    symbol=None,
+                    limit=0,
+                    actual=portfolio_value,
+                    severity="veto"
+                )],
+                applied_rules=["portfolio_value"],
+                reason="Portfolio value is zero or negative"
+            )
+        
+        for order in orders:
+            # Calculate projected weight from order
+            projected_value = order.quantity * order.expected_price
+            projected_weight = projected_value / portfolio_value
+            
+            tolerance = 1.0 + CONSTANTS.risk.ORDER_SIZE_TOLERANCE
+            max_allowed = fund.risk_limits.max_position_pct * tolerance
+            
+            if projected_weight > max_allowed:
+                violations.append(RiskViolation(
+                    rule_name="order_size_exceeds_limit",
+                    symbol=order.symbol,
+                    limit=fund.risk_limits.max_position_pct,
+                    actual=projected_weight,
+                    severity="veto"
+                ))
+        applied_rules.append("order_size_check")
+        
+        if any(v.severity == "veto" for v in violations):
+            return RiskCheckResult(
+                status="vetoed",
+                scale_factor=0.0,
+                violations=violations,
+                applied_rules=applied_rules,
+                reason="Order validation failed"
+            )
+        
+        return RiskCheckResult(
+            status="approved",
+            scale_factor=1.0,
+            violations=violations,
+            applied_rules=applied_rules,
+            reason=None
+        )
+    
+    def check_post_fill(
+        self,
+        fills: List[Fill],
+        fund: "Fund",
+        new_portfolio: "FundPortfolio"
+    ) -> PostFillAction:
+        """
+        Stage 3: Post-execution validation.
+        
+        Checks circuit breakers and may trigger go_flat.
+        Returns quantity-based close orders (no stale prices).
+        """
+        # Update P&L tracking
+        self._update_pnl_tracking(fund, new_portfolio)
+        
+        # Check circuit breakers
+        risk_state = self.risk_state_repo.get(fund.fund_id)
+        if risk_state and self._circuit_breaker_tripped(fund, risk_state):
+            self._enter_cooldown(fund, "circuit_breaker")
+            
+            if fund.policy.go_flat_on_circuit_breaker:
+                # Generate quantity-based close orders (no prices needed)
+                close_orders = self._generate_close_orders(new_portfolio)
+                return PostFillAction(
+                    action="go_flat",
+                    reason="Circuit breaker tripped - closing all positions",
+                    close_orders=close_orders
+                )
+            else:
+                return PostFillAction(
+                    action="halt",
+                    reason="Circuit breaker tripped - halting trading",
+                    close_orders=[]
                 )
         
-        return RiskCheckResult(approved=True)
+        return PostFillAction(action="none", reason=None, close_orders=[])
     
-    def check_vix(self, vix_level: float) -> RiskCheckResult:
-        """Check if VIX is too high"""
-        if vix_level > self.vix_halt_threshold:
-            self._is_halted = True
-            return RiskCheckResult(
-                approved=False,
-                reason=f"VIX {vix_level:.1f} exceeds halt threshold "
-                       f"{self.vix_halt_threshold}"
-            )
-        
-        self._is_halted = False
-        return RiskCheckResult(approved=True)
-    
-    def check_decision(
+    def _update_pnl_tracking(
         self,
-        decision: TradingDecision,
-        manager_id: str,
-        portfolio: Portfolio,
-        start_of_day_value: float,
-        vix_level: Optional[float] = None
-    ) -> RiskCheckResult:
-        """
-        Run all risk checks on a decision.
+        fund: "Fund",
+        portfolio: "FundPortfolio"
+    ) -> None:
+        """Update P&L tracking for circuit breakers."""
+        risk_state = self.risk_state_repo.get(fund.fund_id)
         
-        Args:
-            decision: Trading decision to check
-            manager_id: ID of the manager
-            portfolio: Current portfolio state
-            start_of_day_value: Portfolio value at start of day
-            vix_level: Current VIX level (optional)
-        
-        Returns:
-            RiskCheckResult with approval status
-        """
-        if self._is_halted:
-            return RiskCheckResult(
-                approved=False,
-                reason="Trading halted due to market conditions"
+        if risk_state is None:
+            risk_state = FundRiskState(
+                fund_id=fund.fund_id,
+                peak_nav=portfolio.total_value
             )
         
-        # Check VIX if provided
-        if vix_level:
-            vix_check = self.check_vix(vix_level)
-            if not vix_check.approved:
-                return vix_check
+        current_nav = portfolio.total_value
         
-        # Check daily loss
-        loss_check = self.check_daily_loss(manager_id, portfolio, start_of_day_value)
-        if not loss_check.approved:
-            return loss_check
+        # Update peak NAV
+        if current_nav > risk_state.peak_nav:
+            risk_state.peak_nav = current_nav
         
-        # Check trade count
-        count_check = self.check_trade_count(manager_id)
-        if not count_check.approved:
-            return count_check
+        # Calculate drawdown from peak
+        if risk_state.peak_nav > 0:
+            drawdown = (risk_state.peak_nav - current_nav) / risk_state.peak_nav
+            risk_state.current_weekly_drawdown_pct = drawdown
         
-        # Check position size
-        size_check = self.check_position_size(decision, portfolio)
-        if not size_check.approved:
-            return size_check
+        self.risk_state_repo.upsert(risk_state)
+    
+    def _circuit_breaker_tripped(
+        self,
+        fund: "Fund",
+        risk_state: FundRiskState
+    ) -> bool:
+        """Check if any circuit breaker has been tripped."""
+        # Daily loss limit
+        if abs(risk_state.current_daily_pnl_pct) > fund.risk_limits.max_daily_loss_pct:
+            return True
         
-        return size_check  # May contain modified decision
+        # Weekly drawdown limit
+        if risk_state.current_weekly_drawdown_pct > fund.risk_limits.max_weekly_drawdown_pct:
+            return True
+        
+        return False
     
-    def record_trade(self, manager_id: str) -> None:
-        """Record that a trade was made"""
-        self._trades_today[manager_id] = self._trades_today.get(manager_id, 0) + 1
+    def _enter_cooldown(self, fund: "Fund", reason: str) -> None:
+        """Enter cooldown mode."""
+        cooldown_until = datetime.utcnow() + timedelta(
+            days=fund.risk_limits.breach_cooldown_days
+        )
+        
+        risk_state = self.risk_state_repo.get(fund.fund_id)
+        if risk_state is None:
+            risk_state = FundRiskState(fund_id=fund.fund_id)
+        
+        risk_state.risk_off_until = cooldown_until
+        risk_state.last_breach_reason = reason
+        risk_state.last_breach_time = datetime.utcnow()
+        
+        self.risk_state_repo.upsert(risk_state)
     
-    def reset_daily(self) -> None:
-        """Reset daily counters"""
-        self._trades_today = {}
-        self._daily_loss = {}
+    def _generate_close_orders(
+        self,
+        portfolio: "FundPortfolio"
+    ) -> List[CloseOrder]:
+        """
+        Generate quantity-based close orders.
+        
+        FIXED: No price calculation needed - market orders at current quantity.
+        This avoids stale price issues in go_flat.
+        """
+        close_orders: List[CloseOrder] = []
+        
+        for symbol, position in portfolio.positions.items():
+            if position.quantity == 0:
+                continue
+            
+            # Close longs by selling, close shorts by buying
+            if position.quantity > 0:
+                close_orders.append(CloseOrder(
+                    symbol=symbol,
+                    quantity=position.quantity,
+                    side="sell",
+                    order_type="market",
+                    urgency="immediate",
+                    max_slippage_bps=CONSTANTS.risk.EMERGENCY_CLOSE_SLIPPAGE_BPS
+                ))
+            else:
+                close_orders.append(CloseOrder(
+                    symbol=symbol,
+                    quantity=abs(position.quantity),
+                    side="buy",
+                    order_type="market",
+                    urgency="immediate",
+                    max_slippage_bps=CONSTANTS.risk.EMERGENCY_CLOSE_SLIPPAGE_BPS
+                ))
+        
+        return close_orders
     
-    def is_halted(self) -> bool:
-        """Check if trading is halted"""
-        return self._is_halted
+    def get_risk_state(self, fund_id: str) -> Optional[FundRiskState]:
+        """Get current risk state for a fund."""
+        return self.risk_state_repo.get(fund_id)
     
-    def resume_trading(self) -> None:
-        """Resume trading after halt"""
-        self._is_halted = False
+    def clear_cooldown(self, fund_id: str) -> None:
+        """Clear cooldown for a fund (for testing)."""
+        risk_state = self.risk_state_repo.get(fund_id)
+        if risk_state:
+            risk_state.risk_off_until = None
+            self.risk_state_repo.upsert(risk_state)

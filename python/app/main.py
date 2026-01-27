@@ -141,64 +141,114 @@ async def get_performance(
     return snapshots
 
 
-# Strategy signals endpoint (mock for now)
+# Strategy signals endpoint - REAL DATA from yfinance
 @app.get("/api/signals", response_model=StrategySignals)
-async def get_signals():
-    """Get current strategy signals from the toolbox"""
-    # Mock signals - will be replaced with actual signal generation
-    return StrategySignals(
-        momentum=[
-            MomentumSignal(symbol="NVDA", score=0.85),
-            MomentumSignal(symbol="MSFT", score=0.62),
-            MomentumSignal(symbol="AAPL", score=0.45),
-            MomentumSignal(symbol="TSLA", score=-0.15),
-        ],
-        meanReversion=[
-            MeanReversionSignal(symbol="TSLA", score=0.72),
-            MeanReversionSignal(symbol="AMD", score=0.58),
-            MeanReversionSignal(symbol="NVDA", score=-0.45),
-        ],
-        technical=[
+async def get_signals(force_refresh: bool = False):
+    """
+    Get current strategy signals computed from live market data.
+    
+    Uses yfinance to fetch real prices and computes:
+    - Momentum signals (12M return, skip 1M)
+    - Mean reversion signals (Bollinger Z-score)
+    - Technical indicators (RSI, MACD, SMAs, ATR)
+    - Volatility regime detection
+    
+    Results are cached for 5 minutes to avoid rate limits.
+    """
+    try:
+        from core.strategies.signals_service import get_cached_signals
+        
+        # Get real signals (cached for 5 min)
+        result = await get_cached_signals(force_refresh=force_refresh)
+        
+        # Convert to API response format
+        momentum_signals = [
+            MomentumSignal(symbol=s["symbol"], score=s["score"])
+            for s in result.momentum
+        ]
+        
+        mean_reversion_signals = [
+            MeanReversionSignal(symbol=s["symbol"], score=s["score"])
+            for s in result.mean_reversion
+        ]
+        
+        technical_indicators = [
             TechnicalIndicators(
-                symbol="NVDA",
-                rsi=68,
-                macd={"macd": 2.5, "signal": 2.1, "histogram": 0.4},
-                sma20=138,
-                sma50=132,
-                sma200=115,
-                atr=4.2
+                symbol=t["symbol"],
+                rsi=t["rsi"],
+                macd=t["macd"],
+                sma20=t["sma20"],
+                sma50=t["sma50"],
+                sma200=t["sma200"],
+                atr=t["atr"]
             )
-        ],
-        mlPrediction=[
-            MLPrediction(symbol="NVDA", predictedReturn=0.023, confidence=0.72),
-            MLPrediction(symbol="MSFT", predictedReturn=0.015, confidence=0.68),
-        ],
-        volatilityRegime="low_vol_trending_up",
-        semanticSearch=SemanticSearchResult(
-            similarPeriods=[
-                SimilarPeriod(
-                    date="2023-11-15", 
-                    similarity=0.92, 
-                    return5d=0.032, 
-                    return20d=0.078
-                ),
-                SimilarPeriod(
-                    date="2021-03-22", 
-                    similarity=0.88, 
-                    return5d=0.025, 
-                    return20d=0.065
-                ),
-            ],
-            avg5dReturn=0.0182,
-            avg20dReturn=0.0556,
-            positive5dRate=0.72,
-            interpretation=(
-                "Current market conditions resemble low-volatility tech rallies. "
-                "Historically, similar periods led to continued gains."
+            for t in result.technical
+        ]
+        
+        # Build interpretation based on regime
+        regime = result.volatility_regime
+        vol_pct = f"{result.realized_vol * 100:.1f}%"
+        
+        if "low_vol" in regime and "up" in regime:
+            interpretation = (
+                f"Low volatility ({vol_pct} realized) with upward trend. "
+                "Momentum strategies tend to outperform in this regime. "
+                "Focus on winners with strong 12-month returns."
             )
-        ),
-        timestamp=datetime.utcnow()
-    )
+        elif "high_vol" in regime:
+            interpretation = (
+                f"High volatility regime ({vol_pct} realized). "
+                "Mean reversion strategies may work better. "
+                "Look for oversold names with high positive z-scores."
+            )
+        elif "down" in regime:
+            interpretation = (
+                f"Downward trend detected ({vol_pct} vol). "
+                "Consider defensive positioning or reduced exposure. "
+                "Watch for reversal signals in oversold names."
+            )
+        else:
+            interpretation = (
+                f"Normal volatility ({vol_pct} realized), ranging market. "
+                "Mixed signals - consider balanced approach across strategies."
+            )
+        
+        return StrategySignals(
+            momentum=momentum_signals,
+            meanReversion=mean_reversion_signals,
+            technical=technical_indicators,
+            mlPrediction=[],  # No ML predictions yet
+            volatilityRegime=regime,
+            semanticSearch=SemanticSearchResult(
+                similarPeriods=[],  # TODO: Hook up to embeddings search
+                avg5dReturn=0.0,
+                avg20dReturn=0.0,
+                positive5dRate=0.0,
+                interpretation=interpretation
+            ),
+            timestamp=result.timestamp,
+            dataFreshness=result.data_freshness
+        )
+        
+    except Exception as e:
+        # Fallback to minimal response on error
+        print(f"Signal generation error: {e}")
+        return StrategySignals(
+            momentum=[],
+            meanReversion=[],
+            technical=[],
+            mlPrediction=[],
+            volatilityRegime="unknown",
+            semanticSearch=SemanticSearchResult(
+                similarPeriods=[],
+                avg5dReturn=0.0,
+                avg20dReturn=0.0,
+                positive5dRate=0.0,
+                interpretation=f"Error fetching market data: {str(e)}"
+            ),
+            timestamp=datetime.utcnow(),
+            dataFreshness="error"
+        )
 
 
 # Leaderboard endpoint
@@ -702,6 +752,700 @@ async def search_embeddings_for_symbol(
             status_code=500,
             detail=f"Search failed: {str(e)}"
         )
+
+
+# =============================================================================
+# Trading Lab Chat Endpoints
+# =============================================================================
+
+from pydantic import BaseModel
+from typing import List as TypingList
+
+
+class ChatQuery(BaseModel):
+    """Chat query request"""
+    query: str
+    conversation_id: Optional[str] = None
+
+
+class ChatMessageResponse(BaseModel):
+    """Chat message response"""
+    message: str
+    query_type: str
+    data: Optional[dict] = None
+    suggestions: TypingList[str] = []
+    sources: TypingList[str] = []
+
+
+# Store chat instances per conversation
+_chat_instances: dict = {}
+
+
+def get_chat_instance(conversation_id: str = "default"):
+    """Get or create chat instance for a conversation"""
+    if conversation_id not in _chat_instances:
+        from app.chat import TradingLabChat
+        _chat_instances[conversation_id] = TradingLabChat(
+            persist_directory="./chroma_data"
+        )
+    return _chat_instances[conversation_id]
+
+
+@app.post("/api/lab/chat", response_model=ChatMessageResponse)
+async def lab_chat(query: ChatQuery):
+    """
+    Handle conversational queries about markets.
+    
+    Examples:
+    - "What happened after every Fed rate hike?"
+    - "Find periods similar to current conditions"
+    - "Compare AAPL and MSFT"
+    - "Generate a research report on NVDA"
+    """
+    try:
+        conversation_id = query.conversation_id or "default"
+        chat = get_chat_instance(conversation_id)
+        
+        response = await chat.handle_query(query.query)
+        
+        return ChatMessageResponse(
+            message=response.message,
+            query_type=response.query_type.value,
+            data=response.data,
+            suggestions=response.suggestions,
+            sources=response.sources
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Chat error: {str(e)}"
+        )
+
+
+@app.get("/api/lab/suggestions")
+async def get_suggestions():
+    """Get example queries for the chat"""
+    chat = get_chat_instance()
+    return {
+        "suggestions": chat.example_queries
+    }
+
+
+@app.get("/api/lab/history/{conversation_id}")
+async def get_chat_history(conversation_id: str):
+    """Get conversation history"""
+    chat = get_chat_instance(conversation_id)
+    return {
+        "history": chat.get_conversation_history()
+    }
+
+
+@app.delete("/api/lab/history/{conversation_id}")
+async def clear_chat_history(conversation_id: str):
+    """Clear conversation history"""
+    chat = get_chat_instance(conversation_id)
+    chat.clear_history()
+    return {"status": "cleared"}
+
+
+@app.get("/api/lab/context/{symbol}")
+async def get_market_context(symbol: str):
+    """
+    Get deep market context for a symbol.
+    
+    Returns historical analysis, similar periods, and recommendations.
+    """
+    try:
+        from core.context.market_context import MarketContextProvider
+        provider = MarketContextProvider(persist_directory="./chroma_data")
+        context = provider.get_deep_context(symbol.upper())
+        
+        return {
+            "symbol": context.symbol,
+            "current_date": context.current_date,
+            "regime": context.current_regime.value,
+            "volatility": context.current_volatility,
+            "momentum_1m": context.current_momentum_1m,
+            "momentum_3m": context.current_momentum_3m,
+            "recommendation": context.recommended_stance,
+            "confidence": context.confidence_score,
+            "interpretation": context.market_interpretation,
+            "avg_forward_return_1m": context.avg_forward_return_1m,
+            "avg_forward_return_3m": context.avg_forward_return_3m,
+            "positive_outcome_rate": context.positive_outcome_rate,
+            "worst_case_drawdown": context.worst_case_drawdown,
+            "key_risks": context.key_risks,
+            "similar_periods": [
+                {
+                    "date": p.date,
+                    "similarity": p.similarity,
+                    "regime": p.regime.value,
+                    "narrative": p.narrative,
+                    "geopolitical_context": p.geopolitical_context,
+                    "forward_return_1m": p.forward_outcome.return_1m,
+                    "forward_return_3m": p.forward_outcome.return_3m
+                }
+                for p in context.similar_periods[:10]
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get context: {str(e)}"
+        )
+
+
+@app.get("/api/lab/sentiment")
+async def get_market_sentiment():
+    """Get current market sentiment and external context"""
+    try:
+        from core.context.external_data import ExternalDataProvider
+        provider = ExternalDataProvider()
+        context = provider.get_full_context()
+        
+        return {
+            "timestamp": context.timestamp.isoformat(),
+            "sentiment": {
+                "level": context.sentiment.sentiment_level.value,
+                "vix": context.sentiment.vix_level,
+                "vix_percentile": context.sentiment.vix_percentile,
+                "breadth": context.sentiment.breadth,
+                "interpretation": context.sentiment.interpretation
+            },
+            "economic": {
+                "ten_year_yield": context.economic.ten_year_yield,
+                "yield_curve_spread": context.economic.yield_curve_spread,
+                "recession_risk": context.economic.is_recession_risk,
+                "interpretation": context.economic.interpretation
+            },
+            "narrative": context.market_narrative,
+            "geopolitical": context.geopolitical_summary
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get sentiment: {str(e)}"
+        )
+
+
+# =============================================================================
+# Research Query Engine Endpoints
+# =============================================================================
+
+class ResearchQueryRequest(BaseModel):
+    """Research query request"""
+    query_type: str = "stock_analysis"
+    symbols: TypingList[str]
+    topic: Optional[str] = None
+    time_period: str = "1y"
+    compare_to: Optional[TypingList[str]] = None
+
+
+class ResearchReportResponse(BaseModel):
+    """Research report response"""
+    title: str
+    report_type: str
+    generated_at: str
+    symbols: TypingList[str]
+    executive_summary: str
+    sections: TypingList[dict]
+    recommendation: str
+    confidence: float
+    key_risks: TypingList[str]
+    sources: TypingList[str]
+    markdown: str
+
+
+@app.post("/api/lab/research", response_model=ResearchReportResponse)
+async def generate_research_report(request: ResearchQueryRequest):
+    """
+    Generate an AI-powered research report.
+    
+    Report types:
+    - stock_analysis: Deep dive into a single stock
+    - market_outlook: Overall market conditions
+    - historical_comparison: Compare current to historical periods
+    - risk_assessment: Focus on risk factors
+    - trade_idea: Actionable trade setup
+    """
+    try:
+        from core.research.engine import ResearchEngine, ResearchQuery, ReportType
+        
+        engine = ResearchEngine(persist_directory="./chroma_data")
+        
+        # Map string to enum
+        report_type_map = {
+            "stock_analysis": ReportType.STOCK_ANALYSIS,
+            "market_outlook": ReportType.MARKET_OUTLOOK,
+            "historical_comparison": ReportType.HISTORICAL_COMPARISON,
+            "risk_assessment": ReportType.RISK_ASSESSMENT,
+            "trade_idea": ReportType.TRADE_IDEA
+        }
+        
+        query = ResearchQuery(
+            query_type=report_type_map.get(
+                request.query_type, 
+                ReportType.STOCK_ANALYSIS
+            ),
+            symbols=request.symbols,
+            topic=request.topic,
+            time_period=request.time_period,
+            compare_to=request.compare_to
+        )
+        
+        report = await engine.generate_report(query)
+        
+        return ResearchReportResponse(
+            title=report.title,
+            report_type=report.report_type.value,
+            generated_at=report.generated_at.isoformat(),
+            symbols=report.symbols,
+            executive_summary=report.executive_summary,
+            sections=[
+                {"title": s.title, "content": s.content, "data": s.data}
+                for s in report.sections
+            ],
+            recommendation=report.recommendation,
+            confidence=report.confidence,
+            key_risks=report.key_risks,
+            sources=report.sources,
+            markdown=report.to_markdown()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Research generation failed: {str(e)}"
+        )
+
+
+@app.get("/api/lab/research/{symbol}")
+async def get_stock_research(
+    symbol: str,
+    report_type: str = Query(
+        default="stock_analysis",
+        pattern="^(stock_analysis|risk_assessment|trade_idea)$"
+    )
+):
+    """
+    Quick research report for a single symbol.
+    
+    Shortcut endpoint that generates the specified report type.
+    """
+    try:
+        from core.research.engine import ResearchEngine, ResearchQuery, ReportType
+        
+        engine = ResearchEngine(persist_directory="./chroma_data")
+        
+        type_map = {
+            "stock_analysis": ReportType.STOCK_ANALYSIS,
+            "risk_assessment": ReportType.RISK_ASSESSMENT,
+            "trade_idea": ReportType.TRADE_IDEA
+        }
+        
+        query = ResearchQuery(
+            query_type=type_map.get(report_type, ReportType.STOCK_ANALYSIS),
+            symbols=[symbol.upper()]
+        )
+        
+        report = await engine.generate_report(query)
+        
+        return {
+            "title": report.title,
+            "report_type": report.report_type.value,
+            "symbol": symbol.upper(),
+            "executive_summary": report.executive_summary,
+            "recommendation": report.recommendation,
+            "confidence": report.confidence,
+            "key_risks": report.key_risks,
+            "markdown": report.to_markdown()
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Research generation failed: {str(e)}"
+        )
+
+
+@app.get("/api/lab/research/market/outlook")
+async def get_market_outlook():
+    """
+    Get current market outlook report.
+    
+    Analyzes major indices and market sentiment.
+    """
+    try:
+        from core.research.engine import ResearchEngine, ResearchQuery, ReportType
+        
+        engine = ResearchEngine(persist_directory="./chroma_data")
+        
+        query = ResearchQuery(
+            query_type=ReportType.MARKET_OUTLOOK,
+            symbols=["SPY", "QQQ", "IWM"]
+        )
+        
+        report = await engine.generate_report(query)
+        
+        return {
+            "title": report.title,
+            "executive_summary": report.executive_summary,
+            "recommendation": report.recommendation,
+            "confidence": report.confidence,
+            "key_risks": report.key_risks,
+            "markdown": report.to_markdown()
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Market outlook generation failed: {str(e)}"
+        )
+
+
+# =============================================================================
+# Collaborative Funds Endpoints
+# =============================================================================
+
+from pydantic import Field
+
+
+class FundResponse(BaseModel):
+    """Fund summary response"""
+    fund_id: str
+    name: str
+    strategy: str
+    description: Optional[str] = None
+    total_value: float
+    cash_balance: float
+    gross_exposure: float
+    net_exposure: float
+    n_positions: int
+    is_active: bool
+    
+    class Config:
+        from_attributes = True
+
+
+class FundDetailResponse(FundResponse):
+    """Detailed fund response including thesis and policy"""
+    thesis: Optional[dict] = None
+    policy: Optional[dict] = None
+    risk_limits: Optional[dict] = None
+
+
+class FundPositionResponse(BaseModel):
+    """Fund position response"""
+    symbol: str
+    quantity: float
+    avg_entry_price: float
+    current_price: float
+    market_value: float
+    unrealized_pnl: float
+    weight_pct: float
+
+
+class DecisionResponse(BaseModel):
+    """Decision record response"""
+    decision_id: str
+    fund_id: str
+    asof_timestamp: str
+    decision_type: str
+    status: str
+    no_trade_reason: Optional[str] = None
+    universe_hash: Optional[str] = None
+    inputs_hash: Optional[str] = None
+    predicted_directions: Optional[dict] = None
+    expected_return: Optional[float] = None
+
+
+class DebateResponse(BaseModel):
+    """Debate transcript summary response"""
+    transcript_id: str
+    fund_id: str
+    started_at: str
+    completed_at: Optional[str] = None
+    num_proposals: int
+    num_critiques: int
+    final_consensus_level: float
+
+
+class FundLeaderboardEntry(BaseModel):
+    """Fund leaderboard entry"""
+    rank: int
+    fund_id: str
+    name: str
+    strategy: str
+    total_value: float
+    gross_exposure: float
+    is_active: bool
+
+
+@app.get("/api/funds", response_model=list[FundResponse])
+async def get_funds(db: AsyncSession = Depends(get_db)):
+    """Get all funds"""
+    from db.models import FundModel
+    
+    result = await db.execute(select(FundModel))
+    funds = result.scalars().all()
+    
+    return [
+        FundResponse(
+            fund_id=f.id,
+            name=f.name,
+            strategy=f.strategy,
+            description=f.description,
+            total_value=float(f.total_value or 0),
+            cash_balance=float(f.cash_balance or 0),
+            gross_exposure=0.0,  # Computed on demand
+            net_exposure=0.0,
+            n_positions=0,
+            is_active=f.is_active,
+        )
+        for f in funds
+    ]
+
+
+@app.get("/api/funds/{fund_id}", response_model=FundDetailResponse)
+async def get_fund(fund_id: str, db: AsyncSession = Depends(get_db)):
+    """Get fund details"""
+    from db.models import FundModel, FundPosition
+    
+    result = await db.execute(
+        select(FundModel).where(FundModel.id == fund_id)
+    )
+    fund = result.scalar_one_or_none()
+    if not fund:
+        raise HTTPException(status_code=404, detail="Fund not found")
+    
+    # Get positions
+    pos_result = await db.execute(
+        select(FundPosition).where(FundPosition.fund_id == fund_id)
+    )
+    positions = pos_result.scalars().all()
+    
+    total_value = float(fund.total_value or 0)
+    gross_exposure = 0.0
+    net_exposure = 0.0
+    
+    if total_value > 0:
+        for pos in positions:
+            market_value = float(pos.quantity or 0) * float(pos.current_price or 0)
+            weight = market_value / total_value
+            gross_exposure += abs(weight)
+            net_exposure += weight
+    
+    return FundDetailResponse(
+        fund_id=fund.id,
+        name=fund.name,
+        strategy=fund.strategy,
+        description=fund.description,
+        total_value=total_value,
+        cash_balance=float(fund.cash_balance or 0),
+        gross_exposure=gross_exposure,
+        net_exposure=net_exposure,
+        n_positions=len(positions),
+        is_active=fund.is_active,
+        thesis=fund.thesis_json,
+        policy=fund.policy_json,
+        risk_limits=fund.risk_limits_json,
+    )
+
+
+@app.get("/api/funds/{fund_id}/positions", response_model=list[FundPositionResponse])
+async def get_fund_positions(fund_id: str, db: AsyncSession = Depends(get_db)):
+    """Get positions for a fund"""
+    from db.models import FundModel, FundPosition
+    
+    # Get fund for total value
+    fund_result = await db.execute(
+        select(FundModel).where(FundModel.id == fund_id)
+    )
+    fund = fund_result.scalar_one_or_none()
+    if not fund:
+        raise HTTPException(status_code=404, detail="Fund not found")
+    
+    total_value = float(fund.total_value or 1)
+    
+    result = await db.execute(
+        select(FundPosition).where(FundPosition.fund_id == fund_id)
+    )
+    positions = result.scalars().all()
+    
+    return [
+        FundPositionResponse(
+            symbol=pos.symbol,
+            quantity=float(pos.quantity or 0),
+            avg_entry_price=float(pos.avg_entry_price or 0),
+            current_price=float(pos.current_price or 0),
+            market_value=float(pos.quantity or 0) * float(pos.current_price or 0),
+            unrealized_pnl=float(pos.unrealized_pnl or 0),
+            weight_pct=(
+                (float(pos.quantity or 0) * float(pos.current_price or 0))
+                / total_value * 100
+            ),
+        )
+        for pos in positions
+    ]
+
+
+@app.get("/api/funds/{fund_id}/decisions", response_model=list[DecisionResponse])
+async def get_fund_decisions(
+    fund_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get recent decisions for a fund"""
+    from db.models import DecisionRecordModel
+    
+    result = await db.execute(
+        select(DecisionRecordModel)
+        .where(DecisionRecordModel.fund_id == fund_id)
+        .order_by(desc(DecisionRecordModel.asof_timestamp))
+        .limit(limit)
+    )
+    decisions = result.scalars().all()
+    
+    return [
+        DecisionResponse(
+            decision_id=d.id,
+            fund_id=d.fund_id,
+            asof_timestamp=d.asof_timestamp.isoformat(),
+            decision_type=d.decision_type,
+            status=d.status,
+            no_trade_reason=d.no_trade_reason,
+            universe_hash=d.universe_hash,
+            inputs_hash=d.inputs_hash,
+            predicted_directions=d.predicted_directions_json,
+            expected_return=d.expected_return,
+        )
+        for d in decisions
+    ]
+
+
+@app.get("/api/decisions/{decision_id}")
+async def get_decision_detail(decision_id: str, db: AsyncSession = Depends(get_db)):
+    """Get full decision record with intent and risk result"""
+    from db.models import DecisionRecordModel
+    
+    result = await db.execute(
+        select(DecisionRecordModel).where(DecisionRecordModel.id == decision_id)
+    )
+    decision = result.scalar_one_or_none()
+    if not decision:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    
+    return {
+        "decision_id": decision.id,
+        "fund_id": decision.fund_id,
+        "snapshot_id": decision.snapshot_id,
+        "asof_timestamp": decision.asof_timestamp.isoformat(),
+        "idempotency_key": decision.idempotency_key,
+        "run_context": decision.run_context,
+        "decision_type": decision.decision_type,
+        "no_trade_reason": decision.no_trade_reason,
+        "status": decision.status,
+        "status_history": decision.status_history_json,
+        "intent": decision.intent_json,
+        "risk_result": decision.risk_result_json,
+        "snapshot_quality": decision.snapshot_quality_json,
+        "universe_result": decision.universe_result_json,
+        "universe_hash": decision.universe_hash,
+        "inputs_hash": decision.inputs_hash,
+        "model_versions": decision.model_versions_json,
+        "prompt_hashes": decision.prompt_hashes_json,
+        "predicted_directions": decision.predicted_directions_json,
+        "expected_return": decision.expected_return,
+        "expected_holding_days": decision.expected_holding_days,
+    }
+
+
+@app.get("/api/decisions/{decision_id}/debate", response_model=DebateResponse)
+async def get_decision_debate(decision_id: str, db: AsyncSession = Depends(get_db)):
+    """Get debate transcript for a decision (drill-down)"""
+    from db.models import DebateTranscriptModel
+    
+    result = await db.execute(
+        select(DebateTranscriptModel)
+        .where(DebateTranscriptModel.decision_id == decision_id)
+    )
+    transcript = result.scalar_one_or_none()
+    if not transcript:
+        raise HTTPException(status_code=404, detail="Debate transcript not found")
+    
+    return DebateResponse(
+        transcript_id=transcript.id,
+        fund_id=transcript.fund_id,
+        started_at=transcript.started_at.isoformat(),
+        completed_at=(
+            transcript.completed_at.isoformat() if transcript.completed_at else None
+        ),
+        num_proposals=transcript.num_proposals,
+        num_critiques=transcript.num_critiques,
+        final_consensus_level=transcript.final_consensus_level or 0.0,
+    )
+
+
+@app.get("/api/debates/{transcript_id}")
+async def get_debate_detail(transcript_id: str, db: AsyncSession = Depends(get_db)):
+    """Get full debate transcript with all messages"""
+    from db.models import DebateTranscriptModel
+    
+    result = await db.execute(
+        select(DebateTranscriptModel).where(DebateTranscriptModel.id == transcript_id)
+    )
+    transcript = result.scalar_one_or_none()
+    if not transcript:
+        raise HTTPException(status_code=404, detail="Debate transcript not found")
+    
+    return {
+        "transcript_id": transcript.id,
+        "fund_id": transcript.fund_id,
+        "snapshot_id": transcript.snapshot_id,
+        "started_at": transcript.started_at.isoformat(),
+        "completed_at": (
+            transcript.completed_at.isoformat() if transcript.completed_at else None
+        ),
+        "messages": transcript.messages_json or [],
+        "num_proposals": transcript.num_proposals,
+        "num_critiques": transcript.num_critiques,
+        "final_consensus_level": transcript.final_consensus_level,
+        "total_input_tokens": transcript.total_input_tokens,
+        "total_output_tokens": transcript.total_output_tokens,
+    }
+
+
+@app.get("/api/funds/leaderboard", response_model=list[FundLeaderboardEntry])
+async def get_funds_leaderboard(db: AsyncSession = Depends(get_db)):
+    """Get fund leaderboard sorted by total value"""
+    from db.models import FundModel
+    
+    result = await db.execute(
+        select(FundModel).order_by(desc(FundModel.total_value))
+    )
+    funds = result.scalars().all()
+    
+    entries = []
+    for i, fund in enumerate(funds):
+        entries.append(FundLeaderboardEntry(
+            rank=i + 1,
+            fund_id=fund.id,
+            name=fund.name,
+            strategy=fund.strategy,
+            total_value=float(fund.total_value or 0),
+            gross_exposure=0.0,  # Would need to compute from positions
+            is_active=fund.is_active,
+        ))
+    
+    return entries
+
+
+@app.post("/api/funds/trading/cycle")
+async def trigger_fund_trading_cycle():
+    """Manually trigger a trading cycle for all funds"""
+    # Placeholder - would instantiate FundTradingEngine and run
+    return {
+        "success": True,
+        "message": "Fund trading cycle not yet implemented",
+        "note": "This will run debates for all active funds"
+    }
 
 
 if __name__ == "__main__":
