@@ -42,6 +42,13 @@ const strategyLabels: Record<FundStrategy, string> = {
   quality_ls: 'Quality L/S',
 };
 
+// Helper to get a value from an object that might use snake_case or camelCase
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function get(obj: any, camelKey: string, snakeKey: string): any {
+  if (!obj) return undefined;
+  return obj[camelKey] ?? obj[snakeKey];
+}
+
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -367,28 +374,34 @@ export default function FundDetailPage() {
               </CardHeader>
               <CardContent className="space-y-3">
                 {fund.thesis ? (
-                  <>
-                    <div>
-                      <p className="text-sm text-muted-foreground">Strategy</p>
-                      <p className="font-medium">{fund.thesis.strategy}</p>
-                    </div>
-                    <div>
-                      <p className="text-sm text-muted-foreground">Horizon</p>
-                      <p className="font-medium">
-                        {fund.thesis.horizonDays[0]} - {fund.thesis.horizonDays[1]} days
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-sm text-muted-foreground">Edge</p>
-                      <p className="font-medium">{fund.thesis.edge}</p>
-                    </div>
-                    <div>
-                      <p className="text-sm text-muted-foreground">Universe</p>
-                      <p className="font-medium font-mono text-sm">
-                        {fund.thesis.universeSpec?.type}: {JSON.stringify(fund.thesis.universeSpec?.params)}
-                      </p>
-                    </div>
-                  </>
+                 <>
+                   <div>
+                     <p className="text-sm text-muted-foreground">Strategy</p>
+                     <p className="font-medium">{fund.thesis.strategy}</p>
+                   </div>
+                   <div>
+                     <p className="text-sm text-muted-foreground">Horizon</p>
+                     <p className="font-medium">
+                       {(() => {
+                         const hd = get(fund.thesis, 'horizonDays', 'horizon_days');
+                         return hd ? `${hd[0]} - ${hd[1]} days` : '-';
+                       })()}
+                     </p>
+                   </div>
+                   <div>
+                     <p className="text-sm text-muted-foreground">Edge</p>
+                     <p className="font-medium">{fund.thesis.edge}</p>
+                   </div>
+                   <div>
+                     <p className="text-sm text-muted-foreground">Universe</p>
+                     <p className="font-medium font-mono text-sm">
+                       {(() => {
+                         const us = get(fund.thesis, 'universeSpec', 'universe_spec');
+                         return us ? `${us.type}: ${JSON.stringify(us.params)}` : '-';
+                       })()}
+                     </p>
+                   </div>
+                 </>
                 ) : (
                   <p className="text-muted-foreground">No thesis configuration available</p>
                 )}
@@ -406,37 +419,62 @@ export default function FundDetailPage() {
                     <div className="grid grid-cols-2 gap-4">
                       <div>
                         <p className="text-sm text-muted-foreground">Sizing Method</p>
-                        <p className="font-medium">{fund.policy.sizingMethod}</p>
+                        <p className="font-medium">
+                          {get(fund.policy, 'sizingMethod', 'sizing_method') || '-'}
+                        </p>
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Vol Target</p>
                         <p className="font-medium">
-                          {fund.policy.volTarget ? formatPercent(fund.policy.volTarget) : '-'}
+                          {(() => {
+                            const vt = get(fund.policy, 'volTarget', 'vol_target');
+                            return vt ? formatPercent(vt) : '-';
+                          })()}
                         </p>
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Max Position</p>
-                        <p className="font-medium">{formatPercent(fund.policy.maxPositionPct)}</p>
+                        <p className="font-medium">
+                          {(() => {
+                            const mp = get(fund.policy, 'maxPositionPct', 'max_position_pct');
+                            return mp ? formatPercent(mp) : '-';
+                          })()}
+                        </p>
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Max Positions</p>
-                        <p className="font-medium">{fund.policy.maxPositions}</p>
+                        <p className="font-medium">
+                          {get(fund.policy, 'maxPositions', 'max_positions') || '-'}
+                        </p>
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Max Gross</p>
-                        <p className="font-medium">{formatPercent(fund.policy.maxGrossExposure)}</p>
+                        <p className="font-medium">
+                          {(() => {
+                            const mg = get(fund.policy, 'maxGrossExposure', 'max_gross_exposure');
+                            return mg ? formatPercent(mg) : '-';
+                          })()}
+                        </p>
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Min Cash</p>
-                        <p className="font-medium">{formatPercent(fund.policy.minCashBuffer)}</p>
+                        <p className="font-medium">
+                          {(() => {
+                            const mc = get(fund.policy, 'minCashBuffer', 'min_cash_buffer');
+                            return mc ? formatPercent(mc) : '-';
+                          })()}
+                        </p>
                       </div>
                     </div>
                     <div className="pt-2 border-t">
                       <p className="text-sm text-muted-foreground">Exit Rules</p>
                       <p className="font-medium">
-                        SL: {formatPercent(fund.policy.defaultStopLossPct)} | 
-                        TP: {formatPercent(fund.policy.defaultTakeProfitPct)}
-                        {fund.policy.trailingStop && ' | Trailing'}
+                        {(() => {
+                          const sl = get(fund.policy, 'defaultStopLossPct', 'default_stop_loss_pct');
+                          const tp = get(fund.policy, 'defaultTakeProfitPct', 'default_take_profit_pct');
+                          const ts = get(fund.policy, 'trailingStop', 'trailing_stop');
+                          return `SL: ${sl ? formatPercent(sl) : '-'} | TP: ${tp ? formatPercent(tp) : '-'}${ts ? ' | Trailing' : ''}`;
+                        })()}
                       </p>
                     </div>
                   </>
@@ -457,22 +495,35 @@ export default function FundDetailPage() {
                     <div>
                       <p className="text-sm text-muted-foreground">Max Daily Loss</p>
                       <p className="font-medium text-red-500">
-                        -{formatPercent(fund.riskLimits.maxDailyLossPct)}
+                        {(() => {
+                          const v = get(fund.riskLimits, 'maxDailyLossPct', 'max_daily_loss_pct');
+                          return v ? `-${formatPercent(v)}` : '-';
+                        })()}
                       </p>
                     </div>
                     <div>
                       <p className="text-sm text-muted-foreground">Max Weekly DD</p>
                       <p className="font-medium text-red-500">
-                        -{formatPercent(fund.riskLimits.maxWeeklyDrawdownPct)}
+                        {(() => {
+                          const v = get(fund.riskLimits, 'maxWeeklyDrawdownPct', 'max_weekly_drawdown_pct');
+                          return v ? `-${formatPercent(v)}` : '-';
+                        })()}
                       </p>
                     </div>
                     <div>
                       <p className="text-sm text-muted-foreground">Breach Action</p>
-                      <p className="font-medium">{fund.riskLimits.breachAction}</p>
+                      <p className="font-medium">
+                        {get(fund.riskLimits, 'breachAction', 'breach_action') || '-'}
+                      </p>
                     </div>
                     <div>
                       <p className="text-sm text-muted-foreground">Cooldown</p>
-                      <p className="font-medium">{fund.riskLimits.breachCooldownDays} days</p>
+                      <p className="font-medium">
+                        {(() => {
+                          const v = get(fund.riskLimits, 'breachCooldownDays', 'breach_cooldown_days');
+                          return v ? `${v} days` : '-';
+                        })()}
+                      </p>
                     </div>
                   </div>
                 ) : (
