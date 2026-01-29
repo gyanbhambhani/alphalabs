@@ -182,6 +182,8 @@ class SemanticSearchEngine:
         if not outcomes:
             return "Insufficient historical data for interpretation."
         
+        parts = []  # Initialize parts list
+        
         n = len(outcomes)
         avg_5d = np.mean([o.return_5d for o in outcomes])
         avg_20d = np.mean([o.return_20d for o in outcomes])

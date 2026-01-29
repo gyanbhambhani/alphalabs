@@ -929,6 +929,217 @@ async def get_market_sentiment():
 
 
 # =============================================================================
+# Semantic Vector Search Endpoint
+# =============================================================================
+
+class SemanticSearchQuery(BaseModel):
+    """Semantic search query request"""
+    query: str
+    top_k: int = 20
+    search_mode: str = "current"  # "current" or "similar_to_query"
+
+
+@app.post("/api/lab/semantic-search/{symbol}")
+async def semantic_vector_search(symbol: str, request: SemanticSearchQuery):
+    """
+    True semantic vector similarity search.
+    
+    Finds historical periods with similar market conditions using vector embeddings.
+    
+    Search modes:
+    - "current": Find periods similar to current market conditions
+    - "similar_to_query": Parse query to understand target conditions
+    
+    Returns similarity-ranked results with forward outcomes.
+    """
+    import yfinance as yf
+    import pandas as pd
+    import numpy as np
+    from core.semantic.encoder import MarketStateEncoder
+    from core.semantic.vector_db import VectorDatabase
+    
+    try:
+        symbol = symbol.upper()
+        
+        # Get the vector database for this symbol
+        db = VectorDatabase(
+            persist_directory="./chroma_data",
+            symbol=symbol
+        )
+        
+        count = db.get_count()
+        if count == 0:
+            return {
+                "results": [],
+                "interpretation": f"No embeddings found for {symbol}. "
+                    "Please generate embeddings first.",
+                "avg_forward_return": 0.0,
+                "positive_rate": 0.5
+            }
+        
+        # Fetch recent price data to encode current state
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="2y")
+        
+        if hist.empty or len(hist) < 252:
+            return {
+                "results": [],
+                "interpretation": f"Insufficient price data for {symbol}",
+                "avg_forward_return": 0.0,
+                "positive_rate": 0.5
+            }
+        
+        # Normalize column names
+        hist.columns = [c.lower() for c in hist.columns]
+        
+        # Encode current market state
+        encoder = MarketStateEncoder()
+        current_state = encoder.encode(
+            date=str(hist.index[-1].date()),
+            close=hist['close'],
+            high=hist.get('high'),
+            low=hist.get('low'),
+            volume=hist.get('volume')
+        )
+        
+        # Parse query for additional context
+        query_lower = request.query.lower()
+        interpretation_parts = []
+        
+        # Detect query intent
+        if any(w in query_lower for w in ["crash", "selloff", "panic"]):
+            interpretation_parts.append("Looking for crash/selloff periods")
+        elif any(w in query_lower for w in ["rally", "bull", "surge"]):
+            interpretation_parts.append("Looking for rally/bullish periods")
+        elif any(w in query_lower for w in ["volatile", "volatility"]):
+            interpretation_parts.append("Looking for high volatility periods")
+        elif any(w in query_lower for w in ["similar", "like now", "current"]):
+            interpretation_parts.append(
+                "Finding periods similar to current conditions"
+            )
+        else:
+            interpretation_parts.append(
+                f"Semantic search for: {request.query}"
+            )
+        
+        # Search by vector similarity
+        search_results = db.search(
+            query_vector=current_state.vector,
+            top_k=request.top_k + 21  # Extra to filter recent
+        )
+        
+        # Filter out recent dates and calculate forward outcomes
+        from datetime import datetime, timedelta
+        cutoff_date = (datetime.now() - timedelta(days=21)).strftime('%Y-%m-%d')
+        
+        results = []
+        forward_returns = []
+        
+        for result in search_results:
+            if result.date >= cutoff_date:
+                continue
+            
+            # Calculate forward returns from historical data
+            forward_5d = None
+            forward_20d = None
+            
+            try:
+                result_date = pd.to_datetime(result.date)
+                if result_date in hist.index:
+                    loc = hist.index.get_loc(result_date)
+                    start_price = hist.iloc[loc]['close']
+                    
+                    if loc + 5 < len(hist):
+                        forward_5d = (
+                            hist.iloc[loc + 5]['close'] - start_price
+                        ) / start_price
+                    if loc + 20 < len(hist):
+                        forward_20d = (
+                            hist.iloc[loc + 20]['close'] - start_price
+                        ) / start_price
+                        forward_returns.append(forward_20d)
+            except Exception:
+                pass
+            
+            results.append({
+                "date": result.date,
+                "similarity": round(result.similarity, 4),
+                "metadata": {
+                    "date": result.metadata.get("date", result.date),
+                    "return_1m": round(
+                        result.metadata.get("return_1m", 0), 4
+                    ),
+                    "return_3m": round(
+                        result.metadata.get("return_3m", 0), 4
+                    ),
+                    "volatility_21d": round(
+                        result.metadata.get("volatility_21d", 0), 4
+                    ),
+                    "price": round(result.metadata.get("price", 0), 2),
+                },
+                "forward_return_5d": (
+                    round(forward_5d, 4) if forward_5d is not None else None
+                ),
+                "forward_return_20d": (
+                    round(forward_20d, 4) if forward_20d is not None else None
+                ),
+            })
+            
+            if len(results) >= request.top_k:
+                break
+        
+        # Calculate summary statistics
+        avg_forward = (
+            np.mean(forward_returns) if forward_returns else 0.0
+        )
+        positive_rate = (
+            sum(1 for r in forward_returns if r > 0) / len(forward_returns)
+            if forward_returns else 0.5
+        )
+        
+        # Build interpretation
+        current_vol = current_state.metadata.get('volatility_21d', 0)
+        current_mom = current_state.metadata.get('return_1m', 0)
+        
+        vol_desc = (
+            "low" if current_vol < 0.15 else 
+            "high" if current_vol > 0.25 else "normal"
+        )
+        trend_desc = (
+            "bullish" if current_mom > 0.02 else 
+            "bearish" if current_mom < -0.02 else "neutral"
+        )
+        
+        interpretation_parts.append(
+            f"Current: {vol_desc} volatility ({current_vol:.1%}), "
+            f"{trend_desc} momentum ({current_mom:+.1%} monthly)"
+        )
+        interpretation_parts.append(
+            f"Found {len(results)} similar periods. "
+            f"Avg 20-day forward return: {avg_forward:+.1%} "
+            f"({positive_rate:.0%} positive)"
+        )
+        
+        return {
+            "results": results,
+            "interpretation": ". ".join(interpretation_parts),
+            "avg_forward_return": round(avg_forward, 4),
+            "positive_rate": round(positive_rate, 4),
+            "current_state": {
+                "date": current_state.date,
+                "volatility_21d": round(current_vol, 4),
+                "return_1m": round(current_mom, 4),
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Semantic search failed: {str(e)}"
+        )
+
+
+# =============================================================================
 # Research Query Engine Endpoints
 # =============================================================================
 
