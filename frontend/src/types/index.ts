@@ -421,3 +421,115 @@ export interface FundLeaderboardEntry {
   grossExposure: number;
   isActive: boolean;
 }
+
+// =============================================================================
+// AI Stock Terminal Types (Stream-First Search)
+// =============================================================================
+
+export type StreamChunkType = 'text' | 'chart' | 'table' | 'error' | 'complete';
+
+export interface ChartSpec {
+  type: string;
+  data: Record<string, unknown>;
+  config?: Record<string, unknown>;
+}
+
+export interface TableSpec {
+  title: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  highlightRows?: number[];
+}
+
+export interface StreamChunk {
+  type: StreamChunkType;
+  content: string | ChartSpec | TableSpec | { message: string };
+  metadata?: Record<string, unknown>;
+}
+
+export interface SimilarPeriodData {
+  date: string;
+  similarity: number;
+  forward_1m: number | null;
+  forward_3m?: number | null;
+  outcome: string;
+  price?: number;
+  volatility?: number;
+}
+
+export interface SimilarPeriodsChartData {
+  periods: SimilarPeriodData[];
+  current_date: string;
+  current_price?: number;
+  avg_forward_1m: number;
+  positive_rate: number;
+  positive_count: number;
+  total_count: number;
+  histogram?: {
+    bins: [number, number][];
+    counts: number[];
+    labels: string[];
+  };
+}
+
+export interface VolatilityRegimeChartData {
+  dates: string[];
+  prices: number[];
+  volatility: number[];
+  regimes: string[];
+  regime_changes: string[];
+  current_regime: string;
+  current_vol: number;
+  avg_vol: number;
+}
+
+export interface ReturnsDistributionChartData {
+  histogram: {
+    bins: [number, number][];
+    counts: number[];
+    labels: string[];
+  };
+  stats: {
+    daily: {
+      mean: number;
+      std: number;
+      skew: number;
+      min: number;
+      max: number;
+    };
+    weekly: {
+      mean: number;
+      std: number;
+      positive_rate: number;
+    };
+    monthly: {
+      mean: number;
+      std: number;
+      positive_rate: number;
+    };
+  };
+  recent_returns: {
+    '1d': number;
+    '1w': number;
+    '1m': number;
+  };
+}
+
+export interface SharpeEvolutionChartData {
+  dates: string[];
+  sharpe: number[];
+  prices: number[];
+  current_sharpe: number;
+  avg_sharpe: number;
+  thresholds: number[];
+}
+
+export interface RiskMetricsTableData {
+  title: string;
+  columns: string[];
+  rows: {
+    Metric: string;
+    Value: string;
+    Interpretation: string;
+  }[];
+}

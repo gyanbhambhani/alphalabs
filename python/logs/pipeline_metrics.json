@@ -1,0 +1,140 @@
+{
+  "timestamp": "2026-02-01T16:23:34.421327",
+  "summary": {
+    "elapsed_seconds": 81.7,
+    "stocks_processed": 503,
+    "embeddings_created": 0,
+    "throughput_per_minute": 369.3,
+    "status_breakdown": {
+      "current": 501,
+      "updated": 0,
+      "new": 0,
+      "failed": 2
+    },
+    "failure_rate": 0.004,
+    "failures_by_type": {
+      "ValueError": 2
+    },
+    "avg_processing_ms": 588.9,
+    "sector_count": 11,
+    "pipeline_version": "2.0.0"
+  },
+  "failures": {
+    "ValueError": [
+      "Q: Insufficient data: 215 rows",
+      "SNDK: Insufficient data: 242 rows"
+    ]
+  },
+  "sectors": {
+    "Communication Services": {
+      "total": 23,
+      "completed": 46,
+      "current": 46,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.7251181602478
+    },
+    "Consumer Discretionary": {
+      "total": 48,
+      "completed": 96,
+      "current": 96,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72505402565002
+    },
+    "Consumer Staples": {
+      "total": 36,
+      "completed": 72,
+      "current": 72,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72492480278015
+    },
+    "Energy": {
+      "total": 22,
+      "completed": 44,
+      "current": 44,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.7248649597168
+    },
+    "Financials": {
+      "total": 76,
+      "completed": 152,
+      "current": 152,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72482490539551
+    },
+    "Health Care": {
+      "total": 60,
+      "completed": 120,
+      "current": 120,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72465586662292
+    },
+    "Industrials": {
+      "total": 80,
+      "completed": 160,
+      "current": 160,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.7245409488678
+    },
+    "Information Technology": {
+      "total": 70,
+      "completed": 140,
+      "current": 136,
+      "updated": 0,
+      "new": 0,
+      "failed": 4,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72441577911377
+    },
+    "Materials": {
+      "total": 26,
+      "completed": 52,
+      "current": 52,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72428917884827
+    },
+    "Real Estate": {
+      "total": 31,
+      "completed": 62,
+      "current": 62,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72425127029419
+    },
+    "Utilities": {
+      "total": 31,
+      "completed": 62,
+      "current": 62,
+      "updated": 0,
+      "new": 0,
+      "failed": 0,
+      "embeddings": 0,
+      "elapsed_seconds": 81.72418713569641
+    }
+  }
+}

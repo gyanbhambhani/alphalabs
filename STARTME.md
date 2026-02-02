@@ -14,6 +14,11 @@ cd /Users/gyanb/Desktop/alphalabs/frontend
 npm run dev
 ```
 
+
+### 3. Populate Database
+
+cd /Users/gyanb/Desktop/alphalabs/python && python3.11 scripts/populate_stocks_table.py
+
 ## Access Points
 
 | URL | Description |

@@ -171,15 +171,37 @@ class VectorDatabase:
         return self.collection.count()
     
     def delete_all(self) -> None:
-        """Delete all states (use with caution)"""
-        # Get all IDs and delete
-        all_data = self.collection.get()
-        if all_data['ids']:
-            self.collection.delete(ids=all_data['ids'])
+        """Delete all states (use with caution) - fast collection drop"""
+        # Fast: delete entire collection and recreate (much faster than deleting IDs)
+        collection_name = self.collection.name
+        try:
+            self.client.delete_collection(name=collection_name)
+        except Exception:
+            pass
+        # Recreate empty collection
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
     
     def get_date_range(self) -> tuple[str, str]:
-        """Get the date range of stored states"""
-        all_data = self.collection.get()
+        """Get the date range of stored states (optimized)"""
+        count = self.collection.count()
+        if count == 0:
+            return ("", "")
+        
+        # For small collections, just get all IDs
+        if count <= 100:
+            all_data = self.collection.get(include=[])
+            if not all_data['ids']:
+                return ("", "")
+            dates = sorted(all_data['ids'])
+            return (dates[0], dates[-1])
+        
+        # For large collections, sample to estimate range
+        # Get a sample of IDs (first and last by insertion order aren't guaranteed)
+        # So we get all IDs but only the IDs (no embeddings/metadata)
+        all_data = self.collection.get(include=[])
         if not all_data['ids']:
             return ("", "")
         

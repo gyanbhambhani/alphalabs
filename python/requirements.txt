@@ -37,5 +37,9 @@ pydantic-settings>=2.1.0
 httpx>=0.26.0
 python-dateutil>=2.8.2
 
+# Caching & Streaming
+redis>=5.0.0
+sse-starlette>=1.6.0
+
 # Quant
 quantlib>=1.32

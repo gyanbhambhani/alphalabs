@@ -99,6 +99,43 @@ export default function ResearchPage() {
     setPage(1);
   };
 
+  const handleSemanticSearch = async (query: string) => {
+    if (!selectedSymbol) return;
+    
+    setIsLoading(true);
+    try {
+      const result = await api.semanticSearch(selectedSymbol, query, perPage);
+      
+      // Convert semantic results to embedding format for display
+      const semanticEmbeddings = result.results.map((r) => ({
+        id: r.date,
+        metadata: {
+          date: r.metadata.date,
+          return1w: 0,
+          return1m: r.metadata.return_1m,
+          return3m: r.metadata.return_3m || 0,
+          return6m: 0,
+          return12m: 0,
+          volatility5d: 0,
+          volatility10d: 0,
+          volatility21d: r.metadata.volatility_21d,
+          volatility63d: 0,
+          price: r.metadata.price,
+        },
+        similarity: r.similarity,
+      }));
+      
+      setEmbeddings(semanticEmbeddings);
+      setTotal(result.results.length);
+      setSearchInterpretation(result.interpretation);
+    } catch (error) {
+      console.error('Semantic search failed:', error);
+      setSearchInterpretation('Semantic search failed. Try keyword filter instead.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const handleSort = (field: string, order: 'asc' | 'desc') => {
     setSortBy(field as typeof sortBy);
     setSortOrder(order);
@@ -247,7 +284,12 @@ export default function ResearchPage() {
                   <CardTitle>Semantic Market Search</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <SearchBar onSearch={handleSearch} isLoading={isLoading} />
+                  <SearchBar
+                    onSearch={handleSearch}
+                    onSemanticSearch={handleSemanticSearch}
+                    isLoading={isLoading}
+                    showModeToggle={true}
+                  />
                   {searchInterpretation && (
                     <div className="mt-3 p-3 bg-muted rounded-lg">
                       <p className="text-sm">
