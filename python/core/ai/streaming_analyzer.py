@@ -5,19 +5,20 @@ Stream-first architecture:
 1. Stream text immediately (0.5s to first content)
 2. Execute tools in parallel
 3. Stream charts/tables as they complete
-4. Optional AI synthesis at the end
+4. Optional AI synthesis at the end (via LangChain)
 
 Graceful error handling:
 - Per-tool try/catch
 - Partial results always shown
 - Warnings for failed tools (not errors)
+
+Refactored to use LangChain for AI synthesis streaming.
 """
 
 import asyncio
+import os
 import logging
 from typing import AsyncGenerator, Optional
-
-from openai import AsyncOpenAI
 
 from core.ai.models import (
     StreamChunk,
@@ -27,6 +28,9 @@ from core.ai.models import (
 )
 from core.ai.query_planner import QueryPlanner
 from core.ai.quant_tools import execute_tool
+
+# Import LangChain streaming components
+from core.langchain.agents import StreamingLLM
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +43,7 @@ class StreamingQuantAnalyzer:
     1. Always show something (partial results > no results)
     2. Fail individual tools, not entire stream
     3. Pre-written explanations (no AI wait for basic insights)
-    4. Optional AI synthesis only when needed
+    4. Optional AI synthesis only when needed (via LangChain)
     """
     
     TOOL_TIMEOUT = 30  # Max seconds per tool
@@ -52,11 +56,21 @@ class StreamingQuantAnalyzer:
             openai_api_key: OpenAI API key for optional synthesis
         """
         self.planner = QueryPlanner()
-        self.openai_client = (
-            AsyncOpenAI(api_key=openai_api_key) 
-            if openai_api_key 
-            else None
-        )
+        
+        # Store API key for LangChain
+        self._api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        
+        # LangChain streaming LLM (lazily initialized)
+        self._streaming_llm: Optional[StreamingLLM] = None
+    
+    def _get_streaming_llm(self) -> Optional[StreamingLLM]:
+        """Lazily initialize LangChain streaming LLM."""
+        if self._streaming_llm is None and self._api_key:
+            self._streaming_llm = StreamingLLM(
+                provider="openai",
+                model="gpt-4o-mini",
+            )
+        return self._streaming_llm
     
     async def analyze_stream(
         self,
@@ -69,7 +83,7 @@ class StreamingQuantAnalyzer:
         1. Initial text (immediately)
         2. Charts/tables as tools complete
         3. Explanations for each result
-        4. Optional AI synthesis
+        4. Optional AI synthesis (via LangChain streaming)
         5. Complete marker
         
         Handles errors gracefully - individual tool failures don't
@@ -148,7 +162,7 @@ class StreamingQuantAnalyzer:
                         failed_tools.append(e.tool_name)
                         yield StreamChunk(
                             type='text',
-                            content=f"⚠️ Could not generate {e.tool_name} ({e.reason})",
+                            content=f"Could not generate {e.tool_name} ({e.reason})",
                             metadata={'stage': 'warning', 'tool': e.tool_name}
                         )
                         
@@ -158,7 +172,7 @@ class StreamingQuantAnalyzer:
                         failed_tools.append("unknown")
                         yield StreamChunk(
                             type='text',
-                            content=f"⚠️ Could not generate analysis ({type(e).__name__})",
+                            content=f"Could not generate analysis ({type(e).__name__})",
                             metadata={'stage': 'warning'}
                         )
             
@@ -175,10 +189,11 @@ class StreamingQuantAnalyzer:
                 )
                 return
             
-            # 5. OPTIONAL AI SYNTHESIS
-            if plan.needs_ai_synthesis and self.openai_client:
+            # 5. OPTIONAL AI SYNTHESIS (via LangChain streaming)
+            streaming_llm = self._get_streaming_llm()
+            if plan.needs_ai_synthesis and streaming_llm:
                 try:
-                    async for chunk in self._synthesize_with_ai(
+                    async for chunk in self._synthesize_with_langchain(
                         session, 
                         successful_results
                     ):
@@ -244,20 +259,21 @@ class StreamingQuantAnalyzer:
             error_type = type(e).__name__
             raise ToolExecutionError(tool_name, error_type)
     
-    async def _synthesize_with_ai(
+    async def _synthesize_with_langchain(
         self,
         session: AnalysisSession,
         results: list[ToolResult]
     ) -> AsyncGenerator[StreamChunk, None]:
         """
-        Optional AI synthesis of results.
+        Optional AI synthesis of results using LangChain streaming.
         
         Only called when:
         1. User asked a question (needs interpretation)
-        2. OpenAI client is configured
+        2. LangChain is configured
         3. We have successful results to interpret
         """
-        if not self.openai_client:
+        streaming_llm = self._get_streaming_llm()
+        if not streaming_llm:
             return
         
         # Build context from results
@@ -266,7 +282,7 @@ class StreamingQuantAnalyzer:
             for r in results
         ])
         
-        prompt = f"""Analyze this stock data and answer the user's question concisely.
+        prompt = f"""You are a concise financial analyst. Give direct answers based on data.
 
 User question: {session.query}
 Symbol(s): {', '.join(session.symbols)}
@@ -278,7 +294,7 @@ Key metrics:
 {self._format_metrics(results)}
 
 Provide a 2-3 sentence interpretation that directly answers the user's question.
-Focus on actionable insights. Don't repeat the raw numbers."""
+Focus on actionable insights. Don't repeat the raw numbers. No disclaimers."""
 
         yield StreamChunk(
             type='text',
@@ -287,31 +303,16 @@ Focus on actionable insights. Don't repeat the raw numbers."""
         )
         
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",  # Fast and cheap
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a concise financial analyst. "
-                        "Give direct answers based on the data. "
-                        "No disclaimers."
-                    )},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=200,
-                stream=True
-            )
-            
-            # Stream AI response
-            async for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield StreamChunk(
-                        type='text',
-                        content=chunk.choices[0].delta.content,
-                        metadata={'stage': 'ai_synthesis', 'streaming': True}
-                    )
+            # Stream AI response using LangChain
+            async for text_chunk in streaming_llm.astream(prompt):
+                yield StreamChunk(
+                    type='text',
+                    content=text_chunk,
+                    metadata={'stage': 'ai_synthesis', 'streaming': True}
+                )
                     
         except Exception as e:
-            logger.warning(f"OpenAI streaming failed: {e}")
+            logger.warning(f"LangChain streaming failed: {e}")
             raise
     
     def _format_metrics(self, results: list[ToolResult]) -> str:

@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
 
 
 class Settings(BaseSettings):
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     google_api_key: str = ""
+    gemini_api_key: str = ""  # Alias for google_api_key
     
     # ChromaDB
     chroma_persist_directory: str = "./chroma_data"
@@ -34,8 +36,10 @@ class Settings(BaseSettings):
     ]
     
     class Config:
-        env_file = ".env"
+        # Load from .env.local first (higher priority), then .env
+        env_file = (".env", ".env.local")
         env_file_encoding = "utf-8"
+        extra = "ignore"  # Ignore extra fields like FRED_API_KEY
 
 
 @lru_cache()

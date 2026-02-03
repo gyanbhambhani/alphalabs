@@ -103,7 +103,10 @@ export function SharpeEvolutionChart({ data, config }: SharpeEvolutionChartProps
                 domain={['auto', 'auto']}
               />
               <Tooltip 
-                formatter={(value: number) => [value.toFixed(2), 'Sharpe']}
+                formatter={(value) => [
+                  typeof value === 'number' ? value.toFixed(2) : String(value), 
+                  'Sharpe'
+                ]}
               />
               
               {/* Reference lines for thresholds */}

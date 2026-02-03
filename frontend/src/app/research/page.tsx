@@ -107,20 +107,21 @@ export default function ResearchPage() {
       const result = await api.semanticSearch(selectedSymbol, query, perPage);
       
       // Convert semantic results to embedding format for display
-      const semanticEmbeddings = result.results.map((r) => ({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const semanticEmbeddings = result.results.map((r: any) => ({
         id: r.date,
         metadata: {
           date: r.metadata.date,
           return1w: 0,
-          return1m: r.metadata.return_1m,
+          return1m: r.metadata.return_1m || 0,
           return3m: r.metadata.return_3m || 0,
           return6m: 0,
           return12m: 0,
           volatility5d: 0,
           volatility10d: 0,
-          volatility21d: r.metadata.volatility_21d,
+          volatility21d: r.metadata.volatility_21d || 0,
           volatility63d: 0,
-          price: r.metadata.price,
+          price: r.metadata.price || 0,
         },
         similarity: r.similarity,
       }));
@@ -264,6 +265,7 @@ export default function ResearchPage() {
 
             <TabsContent value="compare">
               <StockSelector
+                onSelectStock={() => {}}
                 onSelectMultiple={handleMultipleSelect}
                 selectedSymbols={selectedSymbols}
                 multiSelect={true}

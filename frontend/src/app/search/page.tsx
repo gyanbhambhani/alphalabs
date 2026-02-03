@@ -151,28 +151,28 @@ export default function SearchPage() {
       case 'similar_periods':
         return (
           <SimilarPeriodsChart 
-            data={data as SimilarPeriodsChartData} 
+            data={data as unknown as SimilarPeriodsChartData} 
             config={config} 
           />
         );
       case 'volatility_regime':
         return (
           <VolatilityRegimeChart 
-            data={data as VolatilityRegimeChartData} 
+            data={data as unknown as VolatilityRegimeChartData} 
             config={config} 
           />
         );
       case 'returns_distribution':
         return (
           <ReturnsDistributionChart 
-            data={data as ReturnsDistributionChartData} 
+            data={data as unknown as ReturnsDistributionChartData} 
             config={config} 
           />
         );
       case 'sharpe_evolution':
         return (
           <SharpeEvolutionChart 
-            data={data as SharpeEvolutionChartData} 
+            data={data as unknown as SharpeEvolutionChartData} 
             config={config} 
           />
         );

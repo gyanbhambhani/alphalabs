@@ -1,24 +1,33 @@
 """
 LLM Portfolio Manager
 
-Uses LLMs (GPT-4, Claude, Gemini) for autonomous trading decisions.
+Uses LangChain for autonomous trading decisions with multi-provider support.
 Full autonomy to interpret signals and make independent decisions.
 
 Enhanced with:
+- LangChain agents with tool access
+- Structured output parsing (no manual JSON parsing)
 - Deep historical context from semantic search
 - Quantitative models (Sharpe, Black-Scholes)
 - Narrative-style thesis generation
 - Full decision logging and consciousness tracking
 """
-import json
+
+import logging
 from typing import List, Dict, Optional, Literal, Any
-from datetime import datetime
 from dataclasses import dataclass
 
 from core.managers.base import (
     BaseManager, TradingDecision, ManagerContext,
     Action, RiskLimits
 )
+
+# Import LangChain components
+from core.langchain.agents import TradingAgent, get_llm_by_provider
+from core.langchain.schemas import EnhancedTradingDecision as LCEnhancedDecision
+from core.langchain.tools import MARKET_DATA_TOOLS, PORTFOLIO_TOOLS, RESEARCH_TOOLS
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,12 +56,14 @@ class DeepContextData:
 
 class LLMManager(BaseManager):
     """
-    LLM-powered portfolio manager with full autonomy and deep context.
+    LLM-powered portfolio manager using LangChain for orchestration.
     
     Can interpret signals, understand context, and make nuanced decisions
     that pure algorithms cannot.
     
     Enhanced features:
+    - LangChain agents with tool calling
+    - Structured output parsing
     - Deep historical context with narratives
     - Quantitative model integration
     - Full decision consciousness logging
@@ -67,10 +78,11 @@ class LLMManager(BaseManager):
         initial_capital: float = 25000.0,
         risk_limits: Optional[RiskLimits] = None,
         model: Optional[str] = None,
-        temperature: float = 0.4,  # Lower for more consistent reasoning
+        temperature: float = 0.4,
         context_provider: Optional[Any] = None,
         quant_models: Optional[Any] = None,
-        decision_logger: Optional[Any] = None
+        decision_logger: Optional[Any] = None,
+        use_tools: bool = True,
     ):
         super().__init__(
             manager_id=manager_id,
@@ -82,12 +94,16 @@ class LLMManager(BaseManager):
         self.provider = provider
         self.model = model or self._get_default_model(provider)
         self.temperature = temperature
-        self._client = None
+        self.use_tools = use_tools
         
         # Enhanced context providers
         self.context_provider = context_provider
         self.quant_models = quant_models
         self.decision_logger = decision_logger
+        
+        # LangChain agent (lazily initialized)
+        self._agent: Optional[TradingAgent] = None
+        self._llm = None
         
         # Last response for debugging
         self._last_raw_response: str = ""
@@ -102,31 +118,31 @@ class LLMManager(BaseManager):
         }
         return models.get(provider, "gpt-4")
     
-    async def _get_client(self):
-        """Lazily initialize the LLM client"""
-        if self._client is not None:
-            return self._client
-        
-        if self.provider == "openai":
-            from openai import AsyncOpenAI
-            from app.config import get_settings
-            settings = get_settings()
-            self._client = AsyncOpenAI(api_key=settings.openai_api_key)
-        
-        elif self.provider == "anthropic":
-            from anthropic import AsyncAnthropic
-            from app.config import get_settings
-            settings = get_settings()
-            self._client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        
-        elif self.provider == "google":
-            import google.generativeai as genai
-            from app.config import get_settings
-            settings = get_settings()
-            genai.configure(api_key=settings.google_api_key)
-            self._client = genai.GenerativeModel(self.model)
-        
-        return self._client
+    def _get_agent(self) -> TradingAgent:
+        """Lazily initialize the LangChain trading agent."""
+        if self._agent is None:
+            tools = []
+            if self.use_tools:
+                tools = MARKET_DATA_TOOLS + PORTFOLIO_TOOLS + RESEARCH_TOOLS
+            
+            self._agent = TradingAgent(
+                name=self.name,
+                provider=self.provider,
+                model=self.model,
+                temperature=self.temperature,
+                tools=tools if tools else None,
+            )
+        return self._agent
+    
+    def _get_llm(self):
+        """Lazily initialize LangChain LLM for simple calls."""
+        if self._llm is None:
+            self._llm = get_llm_by_provider(
+                self.provider, 
+                self.model, 
+                self.temperature
+            )
+        return self._llm
     
     def _build_prompt(self, context: ManagerContext) -> str:
         """Build basic prompt for the LLM (fallback)"""
@@ -255,46 +271,6 @@ As a conscious AI hedge fund manager, you must:
    - What's your time horizon based on historical patterns?
    - Where's your stop loss and target?
 
-## Response Format
-
-Write your complete analysis, then provide structured decisions:
-
-```json
-{{
-  "thesis": "Your complete investment thesis (500+ words). Explain your thinking like a hedge fund manager writing to investors. Reference specific historical periods. Discuss both bull and bear cases.",
-  
-  "conviction": 0.75,
-  
-  "market_regime": "early_recovery",
-  
-  "geopolitical_factors": [
-    "Factor 1 affecting your view",
-    "Factor 2 affecting your view"
-  ],
-  
-  "trades": [
-    {{
-      "action": "buy",
-      "symbol": "AAPL",
-      "size": 0.15,
-      "reasoning": "Detailed trade-specific reasoning...",
-      "historical_precedent": "2020-03-23",
-      "expected_holding_period": "3-6 months",
-      "stop_loss": -0.08,
-      "target_return": 0.25
-    }}
-  ],
-  
-  "risks": [
-    "Key risk 1",
-    "Key risk 2",
-    "Key risk 3"
-  ],
-  
-  "market_outlook": "Your overall market assessment"
-}}
-```
-
 Important guidelines:
 - Position sizes: max 20% per position, consider volatility
 - If no compelling trade, return empty trades array - patience is a strategy
@@ -304,71 +280,47 @@ Important guidelines:
 """
         return prompt
     
-    def _parse_response(
-        self, 
-        response_text: str
-    ) -> tuple[List[EnhancedDecision], Dict[str, Any]]:
-        """
-        Parse LLM response into enhanced trading decisions.
-        
-        Returns:
-            Tuple of (decisions list, parsed response dict)
-        """
+    def _convert_lc_decision_to_enhanced(
+        self,
+        lc_decision: LCEnhancedDecision,
+    ) -> List[EnhancedDecision]:
+        """Convert LangChain EnhancedTradingDecision to local EnhancedDecision list."""
         decisions = []
-        parsed_data = {}
         
-        self._last_raw_response = response_text
+        self._last_parsed_response = {
+            "thesis": lc_decision.thesis,
+            "conviction": lc_decision.conviction,
+            "market_regime": lc_decision.market_regime,
+            "geopolitical_factors": lc_decision.geopolitical_factors,
+            "risks": lc_decision.risks,
+            "market_outlook": lc_decision.market_outlook,
+        }
         
-        try:
-            # Extract JSON from response
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
+        for trade in lc_decision.trades:
+            action_str = trade.action.lower()
+            if action_str == "buy":
+                action = Action.BUY
+            elif action_str == "sell":
+                action = Action.SELL
+            else:
+                continue
             
-            if json_start == -1 or json_end == 0:
-                return decisions, parsed_data
-            
-            json_str = response_text[json_start:json_end]
-            data = json.loads(json_str)
-            self._last_parsed_response = data
-            parsed_data = data
-            
-            # Extract top-level fields
-            thesis = data.get("thesis", "")
-            conviction = float(data.get("conviction", 0.7))
-            market_regime = data.get("market_regime", "unknown")
-            geopolitical_factors = data.get("geopolitical_factors", [])
-            risks = data.get("risks", [])
-            
-            for d in data.get("trades", data.get("decisions", [])):
-                action_str = d.get("action", "hold").lower()
-                if action_str == "buy":
-                    action = Action.BUY
-                elif action_str == "sell":
-                    action = Action.SELL
-                else:
-                    continue  # Skip holds
-                
-                decisions.append(EnhancedDecision(
-                    action=action,
-                    symbol=d.get("symbol", "").upper(),
-                    size=float(d.get("size", 0.10)),
-                    reasoning=d.get("reasoning", ""),
-                    confidence=conviction,
-                    thesis=thesis,
-                    historical_precedent=d.get("historical_precedent", ""),
-                    expected_holding_period=d.get("expected_holding_period", ""),
-                    stop_loss=d.get("stop_loss"),
-                    target_return=d.get("target_return"),
-                    geopolitical_factors=geopolitical_factors,
-                    market_regime=market_regime
-                ))
+            decisions.append(EnhancedDecision(
+                action=action,
+                symbol=trade.symbol.upper(),
+                size=trade.size,
+                reasoning=trade.reasoning,
+                confidence=lc_decision.conviction,
+                thesis=lc_decision.thesis,
+                historical_precedent=trade.historical_precedent or "",
+                expected_holding_period=trade.expected_holding_period or "",
+                stop_loss=trade.stop_loss,
+                target_return=trade.target_return,
+                geopolitical_factors=lc_decision.geopolitical_factors,
+                market_regime=lc_decision.market_regime,
+            ))
         
-        except json.JSONDecodeError as e:
-            print(f"JSON parse error: {e}")
-            # Try to extract basic info from text
-            pass
-        
-        return decisions, parsed_data
+        return decisions
     
     async def get_deep_context(
         self, 
@@ -391,7 +343,7 @@ Important guidelines:
                     symbol=symbols[0]
                 )
             except Exception as e:
-                print(f"Error getting market context: {e}")
+                logger.warning(f"Error getting market context: {e}")
         
         # Get performance feedback
         if self.decision_logger:
@@ -401,7 +353,7 @@ Important guidelines:
                     last_n=5
                 )
             except Exception as e:
-                print(f"Error getting performance feedback: {e}")
+                logger.warning(f"Error getting performance feedback: {e}")
         
         return deep_data
     
@@ -449,7 +401,7 @@ Important guidelines:
                 symbol=decision.symbol,
                 action=decision.action.value,
                 size=decision.size,
-                price=0.0,  # Will be filled at execution
+                price=0.0,
                 thesis=decision.thesis,
                 conviction=decision.confidence,
                 historical_matches=historical_matches,
@@ -471,56 +423,20 @@ Important guidelines:
             return decision_id
             
         except Exception as e:
-            print(f"Error logging decision: {e}")
+            logger.error(f"Error logging decision: {e}")
             return None
-    
-    async def _call_openai(self, prompt: str) -> str:
-        """Call OpenAI API"""
-        client = await self._get_client()
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert AI portfolio manager making autonomous "
-                        "trading decisions. Respond only with valid JSON."
-                    )
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=self.temperature,
-            max_tokens=1000
-        )
-        return response.choices[0].message.content
-    
-    async def _call_anthropic(self, prompt: str) -> str:
-        """Call Anthropic API"""
-        client = await self._get_client()
-        response = await client.messages.create(
-            model=self.model,
-            max_tokens=1000,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.content[0].text
-    
-    async def _call_google(self, prompt: str) -> str:
-        """Call Google AI API"""
-        client = await self._get_client()
-        response = await client.generate_content_async(prompt)
-        return response.text
     
     async def make_decisions(
         self,
         context: ManagerContext
     ) -> List[TradingDecision]:
         """
-        Make trading decisions using LLM reasoning with deep context.
+        Make trading decisions using LangChain agent.
         
         Full autonomy to interpret signals and make independent decisions.
         Enhanced with:
+        - LangChain agent with tool access
+        - Structured output parsing
         - Deep historical context
         - Quantitative analysis
         - Performance feedback
@@ -535,37 +451,34 @@ Important guidelines:
             try:
                 deep_context = await self.get_deep_context(symbols)
             except Exception as e:
-                print(f"Error fetching deep context: {e}")
+                logger.warning(f"Error fetching deep context: {e}")
         
         # Build enhanced prompt
         prompt = self._build_deep_prompt(context, deep_context)
         
         try:
-            # Call appropriate LLM
-            if self.provider == "openai":
-                response = await self._call_openai(prompt)
-            elif self.provider == "anthropic":
-                response = await self._call_anthropic(prompt)
-            elif self.provider == "google":
-                response = await self._call_google(prompt)
-            else:
-                return []
+            # Use LangChain agent for decision making
+            agent = self._get_agent()
+            lc_decision = await agent.ainvoke({"context": prompt})
             
-            # Parse response into enhanced decisions
-            decisions, parsed_response = self._parse_response(response)
+            # Convert to local EnhancedDecision format
+            decisions = self._convert_lc_decision_to_enhanced(lc_decision)
             
             # Log each decision
             for decision in decisions:
-                decision_id = self._log_decision(decision, deep_context, parsed_response)
+                decision_id = self._log_decision(
+                    decision, 
+                    deep_context, 
+                    self._last_parsed_response
+                )
                 if decision_id:
-                    print(f"Logged decision {decision_id} for {decision.symbol}")
+                    logger.info(f"Logged decision {decision_id} for {decision.symbol}")
             
             # Apply risk limits
             return self.apply_risk_limits(decisions, context)
         
         except Exception as e:
-            # Log error and return no decisions
-            print(f"Error in {self.name} decision making: {e}")
+            logger.error(f"Error in {self.name} decision making: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -575,27 +488,35 @@ Important guidelines:
         context: ManagerContext
     ) -> List[TradingDecision]:
         """
-        Make trading decisions with basic prompt (no deep context).
+        Make trading decisions with LangChain but no tools (simpler/faster).
         
-        Useful for testing or when context providers aren't available.
+        Useful for testing or when tools aren't needed.
         """
         prompt = self._build_deep_prompt(context, None)
         
         try:
-            if self.provider == "openai":
-                response = await self._call_openai(prompt)
-            elif self.provider == "anthropic":
-                response = await self._call_anthropic(prompt)
-            elif self.provider == "google":
-                response = await self._call_google(prompt)
-            else:
-                return []
+            # Use LangChain LLM directly without tools
+            llm = self._get_llm()
             
-            decisions, _ = self._parse_response(response)
-            return self.apply_risk_limits(decisions, context)
+            # Create structured output chain
+            from langchain_core.output_parsers import PydanticOutputParser
+            parser = PydanticOutputParser(pydantic_object=LCEnhancedDecision)
+            
+            full_prompt = prompt + "\n\n" + parser.get_format_instructions()
+            
+            response = await llm.ainvoke(full_prompt)
+            self._last_raw_response = response.content
+            
+            try:
+                lc_decision = parser.parse(response.content)
+                decisions = self._convert_lc_decision_to_enhanced(lc_decision)
+                return self.apply_risk_limits(decisions, context)
+            except Exception as parse_error:
+                logger.warning(f"Parse error: {parse_error}")
+                return []
         
         except Exception as e:
-            print(f"Error in {self.name} simple decision making: {e}")
+            logger.error(f"Error in {self.name} simple decision making: {e}")
             return []
     
     def get_last_thesis(self) -> str:

@@ -97,7 +97,10 @@ export function VolatilityRegimeChart({ data, config }: VolatilityRegimeChartPro
                 domain={['auto', 'auto']}
               />
               <Tooltip 
-                formatter={(value: number) => [`${value.toFixed(1)}%`, 'Volatility']}
+                formatter={(value) => [
+                  typeof value === 'number' ? `${value.toFixed(1)}%` : String(value), 
+                  'Volatility'
+                ]}
                 labelFormatter={(label) => `Date: ${label}`}
               />
               <ReferenceLine 

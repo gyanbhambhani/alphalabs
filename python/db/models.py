@@ -444,3 +444,189 @@ class FundDailySnapshot(Base):
             "idx_fund_snapshots_fund_date", "fund_id", "date", unique=True
         ),
     )
+
+
+# ============================================================================
+# BACKTEST MODELS - AI Fund Time Machine
+# ============================================================================
+
+class BacktestRun(Base):
+    """
+    A single backtest execution.
+    
+    Tracks the configuration and status of a backtest simulation
+    from 2000-2025 across multiple AI funds.
+    """
+    __tablename__ = "backtest_runs"
+    
+    id = Column(String(50), primary_key=True)
+    name = Column(String(100), nullable=True)
+    
+    # Date range
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    
+    # Configuration (JSON)
+    config = Column(JSON, nullable=True)  # funds, universe, parameters
+    fund_ids = Column(JSON, nullable=True)  # List of fund IDs
+    universe = Column(JSON, nullable=True)  # List of symbols
+    initial_cash = Column(Float, default=100000.0)
+    
+    # Status
+    status = Column(String(20), default="pending")  # pending, running, completed, failed
+    error_message = Column(Text, nullable=True)
+    
+    # Progress
+    current_day = Column(Integer, default=0)
+    total_days = Column(Integer, default=0)
+    
+    # Summary stats (filled on completion)
+    total_trades = Column(Integer, default=0)
+    total_decisions = Column(Integer, default=0)
+    elapsed_seconds = Column(Float, nullable=True)
+    
+    # Relationships
+    trades = relationship("BacktestTradeRecord", back_populates="run")
+    decisions = relationship("BacktestDecisionRecord", back_populates="run")
+    snapshots = relationship("BacktestPortfolioSnapshotRecord", back_populates="run")
+    
+    __table_args__ = (
+        Index("idx_backtest_runs_status", "status"),
+        Index("idx_backtest_runs_created", "created_at"),
+    )
+
+
+class BacktestTradeRecord(Base):
+    """
+    Every trade executed in a backtest.
+    
+    Stores full details including AI reasoning.
+    """
+    __tablename__ = "backtest_trades"
+    
+    id = Column(String(50), primary_key=True)
+    run_id = Column(String(50), ForeignKey("backtest_runs.id"), nullable=False)
+    fund_id = Column(String(50), nullable=False)
+    
+    # Trade details
+    trade_date = Column(Date, nullable=False)
+    symbol = Column(String(10), nullable=False)
+    side = Column(String(4), nullable=False)  # buy, sell
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    commission = Column(Float, default=0.0)
+    total_cost = Column(Float, nullable=True)  # quantity * price +/- commission
+    
+    # AI reasoning
+    reasoning = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    signals_snapshot = Column(JSON, nullable=True)  # quant signals at decision time
+    
+    # Execution timing
+    executed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    run = relationship("BacktestRun", back_populates="trades")
+    
+    __table_args__ = (
+        Index("idx_backtest_trades_run", "run_id"),
+        Index("idx_backtest_trades_fund", "fund_id"),
+        Index("idx_backtest_trades_date", "trade_date"),
+        Index("idx_backtest_trades_symbol", "symbol"),
+    )
+
+
+class BacktestDecisionRecord(Base):
+    """
+    Every AI decision (including HOLDs).
+    
+    Captures the full debate and reasoning process.
+    """
+    __tablename__ = "backtest_decisions"
+    
+    id = Column(String(50), primary_key=True)
+    run_id = Column(String(50), ForeignKey("backtest_runs.id"), nullable=False)
+    fund_id = Column(String(50), nullable=False)
+    
+    # Decision details
+    decision_date = Column(Date, nullable=False)
+    action = Column(String(10), nullable=False)  # buy, sell, hold
+    symbol = Column(String(10), nullable=True)  # Null for hold
+    quantity = Column(Float, nullable=True)
+    target_weight = Column(Float, nullable=True)
+    
+    # AI reasoning
+    confidence = Column(Float, nullable=True)
+    reasoning = Column(Text, nullable=True)
+    
+    # Debate transcript (JSON)
+    debate_transcript = Column(JSON, nullable=True)  # Full debate messages
+    
+    # Signals at decision time
+    signals_snapshot = Column(JSON, nullable=True)
+    
+    # Model info
+    models_used = Column(JSON, nullable=True)  # {"analyze": "gemini", "propose": "gpt"}
+    tokens_used = Column(Integer, default=0)
+    
+    # What triggered the decision
+    triggered_by = Column(String(50), nullable=True)  # "momentum", "stop_loss", etc.
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    run = relationship("BacktestRun", back_populates="decisions")
+    
+    __table_args__ = (
+        Index("idx_backtest_decisions_run", "run_id"),
+        Index("idx_backtest_decisions_fund", "fund_id"),
+        Index("idx_backtest_decisions_date", "decision_date"),
+    )
+
+
+class BacktestPortfolioSnapshotRecord(Base):
+    """
+    Daily portfolio state for each fund.
+    
+    Used for equity curves and performance analysis.
+    """
+    __tablename__ = "backtest_portfolio_snapshots"
+    
+    id = Column(String(50), primary_key=True)
+    run_id = Column(String(50), ForeignKey("backtest_runs.id"), nullable=False)
+    fund_id = Column(String(50), nullable=False)
+    
+    # Date
+    snapshot_date = Column(Date, nullable=False)
+    
+    # Portfolio state
+    cash = Column(Float, nullable=False)
+    positions = Column(JSON, nullable=True)  # {symbol: {qty, avg_cost, current_value}}
+    total_value = Column(Float, nullable=False)
+    invested_pct = Column(Float, nullable=True)
+    
+    # Performance metrics
+    daily_return = Column(Float, nullable=True)
+    cumulative_return = Column(Float, nullable=True)
+    max_drawdown = Column(Float, nullable=True)
+    sharpe_ratio = Column(Float, nullable=True)
+    
+    # Trade stats
+    n_positions = Column(Integer, default=0)
+    n_trades_today = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    run = relationship("BacktestRun", back_populates="snapshots")
+    
+    __table_args__ = (
+        Index("idx_backtest_snapshots_run", "run_id"),
+        Index("idx_backtest_snapshots_fund_date", "fund_id", "snapshot_date"),
+    )

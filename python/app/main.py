@@ -1,9 +1,23 @@
 from datetime import datetime
+from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from typing import Optional
+
+# Load environment variables FIRST before anything else
+from dotenv import load_dotenv
+# Look for .env.local in project root (parent of python/)
+project_root = Path(__file__).resolve().parent.parent.parent
+env_local = project_root / ".env.local"
+env_file = project_root / ".env"
+if env_local.exists():
+    load_dotenv(env_local)
+    print(f"Loaded environment from {env_local}")
+elif env_file.exists():
+    load_dotenv(env_file)
+    print(f"Loaded environment from {env_file}")
 
 from app.config import get_settings
 from app.schemas import (
@@ -19,6 +33,7 @@ from app.schemas import (
 from db import get_db, Manager, Portfolio, Position, Trade, DailySnapshot, Stock
 from app.query_parser import parse_query
 from core.semantic.vector_db import VectorDatabase
+from app.backtest_routes import router as backtest_router
 
 settings = get_settings()
 
@@ -36,6 +51,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include backtest routes
+app.include_router(backtest_router)
 
 
 @app.get("/")
