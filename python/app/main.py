@@ -34,6 +34,7 @@ from db import get_db, Manager, Portfolio, Position, Trade, DailySnapshot, Stock
 from app.query_parser import parse_query
 from core.semantic.vector_db import VectorDatabase
 from app.backtest_routes import router as backtest_router
+from app.replay_routes import router as replay_router
 
 settings = get_settings()
 
@@ -52,8 +53,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include backtest routes
+# Include routes
 app.include_router(backtest_router)
+app.include_router(replay_router)
 
 
 @app.get("/")

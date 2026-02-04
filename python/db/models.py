@@ -1,6 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
+import uuid
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, 
     ForeignKey, Text, JSON, DECIMAL, Date, Index
@@ -629,4 +630,148 @@ class BacktestPortfolioSnapshotRecord(Base):
     __table_args__ = (
         Index("idx_backtest_snapshots_run", "run_id"),
         Index("idx_backtest_snapshots_fund_date", "fund_id", "snapshot_date"),
+    )
+
+
+class BacktestDecisionCandidate(Base):
+    """
+    Candidate assets considered for each decision.
+    
+    Critical for training ranking models - stores features for ALL candidates,
+    not just the chosen one.
+    """
+    __tablename__ = "backtest_decision_candidates"
+    
+    id = Column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
+    decision_id = Column(
+        String(50),
+        ForeignKey("backtest_decisions.id"),
+        nullable=False
+    )
+    run_id = Column(String(50), ForeignKey("backtest_runs.id"), nullable=False)
+    
+    # Asset identification
+    symbol = Column(String(10), nullable=False)
+    sector = Column(String(50), nullable=True)
+    
+    # Was this candidate selected?
+    selected = Column(Boolean, default=False, nullable=False)
+    
+    # Full feature vector at decision time
+    features = Column(JSON, nullable=False)
+    # Example:
+    # {
+    #     "price": 25.50,
+    #     "return_1d": 0.02,
+    #     "return_5d": -0.03,
+    #     "return_21d": 0.15,
+    #     "return_63d": 0.42,
+    #     "return_252d": 0.85,
+    #     "volatility_5d": 0.018,
+    #     "volatility_21d": 0.025,
+    #     "volatility_63d": 0.030,
+    #     "rsi_14": 38.5,
+    #     "z_score_20d": -1.8,
+    #     "bollinger_pct": 0.15,
+    #     "momentum_rank_pct": 0.82,
+    #     "sector_id": 5
+    # }
+    
+    # Strategy scores
+    scores = Column(JSON, nullable=True)
+    # Example:
+    # {
+    #     "momentum": 0.7,
+    #     "mean_reversion": -0.2,
+    #     "value": 0.4,
+    #     "combined": 0.5
+    # }
+    
+    # If selected, what weight was assigned?
+    target_weight = Column(Float, nullable=True)
+    
+    # Outcomes (filled post-hoc)
+    outcome_1d = Column(Float, nullable=True)
+    outcome_5d = Column(Float, nullable=True)
+    outcome_21d = Column(Float, nullable=True)
+    outcome_63d = Column(Float, nullable=True)
+    
+    # Realized metrics (if selected)
+    realized_pnl = Column(Float, nullable=True)
+    realized_return = Column(Float, nullable=True)
+    holding_days = Column(Integer, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    decision = relationship("BacktestDecisionRecord")
+    run = relationship("BacktestRun")
+    
+    __table_args__ = (
+        Index("idx_decision_candidates_decision", "decision_id"),
+        Index("idx_decision_candidates_run", "run_id"),
+        Index("idx_decision_candidates_symbol", "symbol"),
+        Index("idx_decision_candidates_selected", "selected"),
+    )
+
+
+class ExperienceRecord(Base):
+    """
+    Experience replay memory - stores past trades for retrieval.
+    
+    Used for contextual bandit / RL-style learning.
+    """
+    __tablename__ = "experience_records"
+    
+    id = Column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
+    decision_id = Column(
+        String(50),
+        ForeignKey("backtest_decisions.id"),
+        nullable=False
+    )
+    run_id = Column(String(50), ForeignKey("backtest_runs.id"), nullable=False)
+    fund_id = Column(String(50), nullable=False)
+    
+    # State vector (normalized features)
+    feature_vector = Column(JSON, nullable=False)
+    # Flattened array of normalized features for similarity search
+    
+    # Action taken
+    action = Column(String(10), nullable=False)  # buy, sell, hold
+    symbol = Column(String(10), nullable=True)
+    weight = Column(Float, nullable=True)
+    
+    # Market regime at decision time
+    regime = Column(String(20), nullable=True)  # "bull_low_vol", "bear_high_vol"
+    
+    # Outcomes
+    outcome_5d = Column(Float, nullable=True)
+    outcome_21d = Column(Float, nullable=True)
+    outcome_63d = Column(Float, nullable=True)
+    
+    # Costs
+    realized_commission = Column(Float, nullable=True)
+    realized_slippage_bps = Column(Float, nullable=True)
+    
+    # Risk metrics
+    max_drawdown = Column(Float, nullable=True)
+    realized_vol = Column(Float, nullable=True)
+    
+    # Success metrics
+    win = Column(Boolean, nullable=True)  # outcome_21d > 0
+    alpha_vs_spy = Column(Float, nullable=True)
+    
+    decision_date = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    decision = relationship("BacktestDecisionRecord")
+    run = relationship("BacktestRun")
+    
+    __table_args__ = (
+        Index("idx_experience_run", "run_id"),
+        Index("idx_experience_fund", "fund_id"),
+        Index("idx_experience_date", "decision_date"),
+        Index("idx_experience_regime", "regime"),
+        Index("idx_experience_win", "win"),
     )

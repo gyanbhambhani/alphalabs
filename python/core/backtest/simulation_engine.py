@@ -13,7 +13,6 @@ Orchestrates the backtest simulation with:
 
 import asyncio
 import uuid
-from collections import deque
 from datetime import date, datetime
 from typing import AsyncGenerator, Dict, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
@@ -39,6 +38,7 @@ from core.backtest.events import (
     ErrorEvent,
 )
 from core.data.snapshot import GlobalMarketSnapshot
+from core.execution.trade_budget import TradeBudget
 
 # Import evaluation metrics for trade outcome tracking
 from core.evals.metrics import OutcomeTracker, compute_fund_metrics, TradeResult, FundMetrics
@@ -75,13 +75,9 @@ class SimulationEngine:
     - Processes 6,300 trading days (2000-2025)
     - Time dilation: compress 25 years into minutes
     - Multiple funds running in parallel
-    - Trade limits: max 3 new positions per rolling week
+    - TradeBudget enforced BEFORE LLM debates (not after)
     - Streams events to frontend via SSE
     """
-    
-    # Trade limits
-    MAX_TRADES_PER_WEEK = 3
-    ROLLING_WINDOW_DAYS = 5
     
     # Commission model
     COMMISSION_PER_SHARE = 0.01
@@ -135,10 +131,11 @@ class SimulationEngine:
             for f in funds
         }
         
-        # Trade tracking (rolling window for rate limiting)
-        self.trade_counts: Dict[str, deque] = {
-            f.fund_id: deque(maxlen=self.ROLLING_WINDOW_DAYS)
-            for f in funds
+        # Trade budgets (replaced old rolling window approach)
+        self.trade_budgets: Dict[str, TradeBudget] = {}
+        self._last_budget_reset: Optional[date] = None
+        self._fund_orders: Dict[str, List] = {
+            f.fund_id: [] for f in funds
         }
         
         # Simulation state
@@ -194,14 +191,66 @@ class SimulationEngine:
             return self.trading_days[self.current_day_idx]
         return None
     
-    def can_trade(self, fund_id: str) -> int:
+    def _get_or_create_budget(
+        self,
+        fund_id: str,
+        current_date: date,
+        fund_thesis: str,
+    ) -> TradeBudget:
         """
-        Returns how many new positions the fund can open.
+        Get or create TradeBudget for fund.
         
-        Max 3 new positions per rolling 5-day week.
+        Handles weekly reset logic.
         """
-        recent_trades = sum(self.trade_counts[fund_id])
-        return max(0, self.MAX_TRADES_PER_WEEK - recent_trades)
+        portfolio = self.portfolios[fund_id]
+        
+        # Check if we need to reset weekly counter
+        if self._last_budget_reset is None:
+            self._last_budget_reset = current_date
+        
+        days_since_reset = (current_date - self._last_budget_reset).days
+        if days_since_reset >= 7:
+            # Reset all budgets
+            for budget in self.trade_budgets.values():
+                budget.reset_weekly_counter()
+            self._last_budget_reset = current_date
+        
+        # Get or create budget
+        if fund_id not in self.trade_budgets:
+            # Determine rebalance cadence from thesis
+            rebalance_cadence = self._infer_rebalance_cadence(fund_thesis)
+            
+            self.trade_budgets[fund_id] = TradeBudget(
+                fund_id=fund_id,
+                current_date=current_date,
+                portfolio_value=portfolio.total_value,
+                trades_this_week=0,
+                max_trades_per_week=3,
+                rebalance_cadence=rebalance_cadence,
+                last_rebalance_date=None,
+                min_weight_delta=0.02,
+                min_order_notional=1000.0,
+            )
+        else:
+            # Update budget state
+            budget = self.trade_budgets[fund_id]
+            budget.current_date = current_date
+            budget.portfolio_value = portfolio.total_value
+        
+        return self.trade_budgets[fund_id]
+    
+    def _infer_rebalance_cadence(self, fund_thesis: str) -> str:
+        """Infer rebalance cadence from fund thesis (temporary)."""
+        thesis_lower = fund_thesis.lower()
+        
+        if "mean reversion" in thesis_lower or "intraday" in thesis_lower:
+            return "daily"
+        elif "quality" in thesis_lower or "value" in thesis_lower:
+            return "monthly"
+        elif "momentum" in thesis_lower or "trend" in thesis_lower:
+            return "weekly"
+        else:
+            return "weekly"  # Default
     
     def set_speed(self, multiplier: float) -> None:
         """Change simulation speed."""
@@ -513,9 +562,15 @@ class SimulationEngine:
         snapshot: GlobalMarketSnapshot,
         current_date: date,
     ) -> FundDayResult:
-        """Run a single fund's trading day."""
+        """Run a single fund's trading day with TradeBudget enforcement."""
         portfolio = self.portfolios[fund.fund_id]
-        available_trades = self.can_trade(fund.fund_id)
+        
+        # Get/create trade budget BEFORE debate
+        budget = self._get_or_create_budget(
+            fund.fund_id,
+            current_date,
+            fund.thesis,
+        )
         
         # Emit debate start
         await self.emit_event(DebateStartEvent(
@@ -525,7 +580,7 @@ class SimulationEngine:
             simulation_date=current_date,
         ))
         
-        # Run AI debate
+        # Run AI debate with budget constraints
         decision = await self.debate_runner.run_debate(
             fund_id=fund.fund_id,
             fund_name=fund.name,
@@ -533,7 +588,7 @@ class SimulationEngine:
             portfolio=portfolio,
             snapshot=snapshot,
             simulation_date=current_date,
-            available_trades=available_trades,
+            trade_budget=budget,  # Pass budget to debate
         )
         
         # Emit debate messages
@@ -591,18 +646,29 @@ class SimulationEngine:
             except Exception as e:
                 logger.error(f"Failed to save decision: {e}")
         
-        # Execute trades
+        # Execute trades (budget was already checked)
         trades = []
         new_positions = 0
         
-        if decision.action != "hold" and available_trades > 0:
-            trade = await self._execute_decision(
-                fund, portfolio, decision, snapshot, current_date
-            )
-            if trade:
-                trades.append(trade)
-                if decision.action == "buy":
-                    new_positions = 1
+        if decision.action != "hold":
+            # Validate decision against budget one more time (safety gate)
+            if decision.action == "buy" and not budget.can_buy():
+                logger.warning(
+                    f"[{fund.fund_id}] Buy decision rejected by budget gate "
+                    f"- this should not happen!"
+                )
+            else:
+                trade = await self._execute_decision(
+                    fund, portfolio, decision, snapshot, current_date
+                )
+                if trade:
+                    trades.append(trade)
+                    self._fund_orders[fund.fund_id].append(trade)
+                    
+                    # Consume budget on successful trade
+                    if decision.action == "buy":
+                        budget.consume_trade_event()
+                        new_positions = 1
         
         return FundDayResult(
             fund_id=fund.fund_id,

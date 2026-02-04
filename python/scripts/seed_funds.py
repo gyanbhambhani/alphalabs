@@ -21,46 +21,58 @@ from db.database import get_async_session
 from db.models import FundModel
 
 
-# Fund definitions based on the architecture
+# Fund definitions with MECHANICAL rules (no narrative vibes)
 FUNDS = [
     {
-        "id": "trend_macro_fund",
-        "name": "Trend + Macro",
-        "strategy": "trend_macro",
+        "id": "momentum_fund",
+        "name": "Momentum Cross-Sectional",
+        "strategy": "momentum",
         "description": (
-            "Regime detection + trend following + vol targeting. "
-            "Focuses on liquid ETFs and index futures with 1-20 day horizon."
+            "12-1 cross-sectional momentum with vol targeting. "
+            "Entry: Top 15% momentum rank. Exit: Falls below 50% rank. "
+            "Rebalance: Monthly."
         ),
         "thesis_json": {
-            "name": "Trend + Macro",
-            "strategy": "trend_macro",
-            "description": "Regime detection, trend following, vol targeting",
-            "horizon_days": [1, 20],
-            "edge": "Regime detection + trend following + vol targeting",
+            "name": "Momentum Cross-Sectional",
+            "strategy": "momentum",
+            "description": "12-month return skipping last month, cross-sectional rank",
+            "horizon_days": [20, 60],
+            "edge": "Cross-sectional momentum persistence",
+            "rules": {
+                "signal": "12-month return skipping last month (252d - 21d)",
+                "entry": "Top 15% momentum rank",
+                "exit": "Falls below 50% rank",
+                "sizing": "Inverse vol, cap 15%",
+                "rebalance": "Monthly (20 trading days)"
+            },
+            "factors": ["return_252d", "return_21d", "momentum_rank_pct", "volatility_21d"],
             "universe_spec": {
-                "type": "etf_set",
-                "params": {"name": "liquid_macro"}
+                "type": "screen",
+                "params": {
+                    "min_adv": 10000000,
+                    "market_cap": "large"
+                }
             },
             "version": "1.0"
         },
         "policy_json": {
             "sizing_method": "vol_target",
             "vol_target": 0.15,
-            "max_position_pct": 0.20,
-            "max_turnover_daily": 0.30,
-            "rebalance_cadence": "daily",
+            "max_position_pct": 0.15,
+            "max_turnover_daily": 0.20,
+            "rebalance_cadence": "monthly",
             "max_positions": 15,
-            "default_stop_loss_pct": 0.05,
-            "default_take_profit_pct": 0.15,
-            "trailing_stop": True,
+            "default_stop_loss_pct": 0.10,
+            "default_take_profit_pct": 0.25,
+            "trailing_stop": False,
             "max_gross_exposure": 1.0,
             "min_cash_buffer": 0.05,
             "go_flat_on_circuit_breaker": True,
             "version": "1.0"
         },
         "risk_limits_json": {
-            "max_position_pct": 0.20,
-            "max_sector_pct": 0.40,
+            "max_position_pct": 0.15,
+            "max_sector_pct": 0.35,
             "max_gross_exposure": 1.0,
             "max_daily_loss_pct": 0.03,
             "max_weekly_drawdown_pct": 0.07,
@@ -72,18 +84,28 @@ FUNDS = [
     },
     {
         "id": "mean_reversion_fund",
-        "name": "Mean Reversion",
+        "name": "Mean Reversion Short-Horizon",
         "strategy": "mean_reversion",
         "description": (
-            "Exploit overreactions in liquid names. "
-            "Microstructure signals, intraday to 3 day horizon."
+            "Oversold + extreme + vol filter. "
+            "Entry: z_score < -2.0 AND rsi < 30 AND vol_spike < 2.5x. "
+            "Exit: z_score > -0.5 OR holding >= 10 days. "
+            "Rebalance: Daily."
         ),
         "thesis_json": {
-            "name": "Mean Reversion",
+            "name": "Mean Reversion Short-Horizon",
             "strategy": "mean_reversion",
-            "description": "Exploit overreactions, volatility spikes",
-            "horizon_days": [0, 3],
-            "edge": "Microstructure signals, overreaction, volatility spikes",
+            "description": "Trade statistical extremes with vol filter",
+            "horizon_days": [1, 10],
+            "edge": "Statistical extremes mean-revert short-term",
+            "rules": {
+                "entry": "z_score_20d < -2.0 AND rsi_14 < 30 AND vol_spike_ratio < 2.5",
+                "exit": "z_score_20d > -0.5 OR holding_days >= 10",
+                "sizing": "Small bets, inverse vol, cap 7%",
+                "liquidity_filter": "min_adv > 10M",
+                "rebalance": "Daily"
+            },
+            "factors": ["z_score_20d", "rsi_14", "volatility_21d", "vol_spike_ratio", "adv_20d"],
             "universe_spec": {
                 "type": "screen",
                 "params": {
@@ -97,24 +119,24 @@ FUNDS = [
         "policy_json": {
             "sizing_method": "equal_risk",
             "vol_target": 0.20,
-            "max_position_pct": 0.10,
+            "max_position_pct": 0.07,
             "max_turnover_daily": 0.50,
-            "rebalance_cadence": "intraday",
+            "rebalance_cadence": "daily",
             "max_positions": 20,
             "default_stop_loss_pct": 0.03,
             "default_take_profit_pct": 0.05,
             "trailing_stop": False,
             "max_gross_exposure": 1.2,
-            "min_cash_buffer": 0.10,
+            "min_cash_buffer": 0.05,
             "go_flat_on_circuit_breaker": True,
             "version": "1.0"
         },
         "risk_limits_json": {
-            "max_position_pct": 0.10,
+            "max_position_pct": 0.07,
             "max_sector_pct": 0.30,
             "max_gross_exposure": 1.2,
-            "max_daily_loss_pct": 0.02,
-            "max_weekly_drawdown_pct": 0.05,
+            "max_daily_loss_pct": 0.025,
+            "max_weekly_drawdown_pct": 0.06,
             "breach_action": "reduce",
             "breach_cooldown_days": 1
         },
@@ -122,70 +144,29 @@ FUNDS = [
         "total_value": 100000,
     },
     {
-        "id": "event_driven_fund",
-        "name": "Event-Driven",
-        "strategy": "event_driven",
+        "id": "value_fund",
+        "name": "Quality Value",
+        "strategy": "value",
         "description": (
-            "Earnings plays and event catalysts. "
-            "-3 to +5 days around events, focus on guidance surprise."
+            "Quality value composite. "
+            "Entry: Top 20% composite score (earnings yield + FCF yield + ROIC - leverage). "
+            "Exit: Falls below 40% OR holding > 90 days. "
+            "Rebalance: Quarterly."
         ),
         "thesis_json": {
-            "name": "Event-Driven",
-            "strategy": "event_driven",
-            "description": "Earnings plays, guidance surprise, implied vs realized vol",
-            "horizon_days": [-3, 5],
-            "edge": "Guidance surprise, transcript sentiment, implied vs realized vol",
-            "universe_spec": {
-                "type": "screen",
-                "params": {
-                    "upcoming_earnings": True,
-                    "options_liquid": True,
-                    "min_adv": 5000000
-                }
+            "name": "Quality Value",
+            "strategy": "value",
+            "description": "Cheap, profitable firms with stable balance sheets",
+            "horizon_days": [60, 180],
+            "edge": "Value without traps (profitability filter)",
+            "rules": {
+                "signal": "composite = z(earnings_yield) + z(fcf_yield) + z(roic) - z(leverage)",
+                "entry": "Top 20% composite score",
+                "exit": "Falls below 40% score OR holding > 90 days",
+                "sizing": "Equal weight, cap 10%, max 25% per sector",
+                "rebalance": "Quarterly"
             },
-            "version": "1.0"
-        },
-        "policy_json": {
-            "sizing_method": "event_based",
-            "vol_target": 0.25,
-            "max_position_pct": 0.08,
-            "max_turnover_daily": 0.40,
-            "rebalance_cadence": "event_driven",
-            "max_positions": 10,
-            "default_stop_loss_pct": 0.08,
-            "default_take_profit_pct": 0.12,
-            "trailing_stop": False,
-            "max_gross_exposure": 0.8,
-            "min_cash_buffer": 0.20,
-            "go_flat_on_circuit_breaker": True,
-            "version": "1.0"
-        },
-        "risk_limits_json": {
-            "max_position_pct": 0.08,
-            "max_sector_pct": 0.25,
-            "max_gross_exposure": 0.8,
-            "max_daily_loss_pct": 0.04,
-            "max_weekly_drawdown_pct": 0.08,
-            "breach_action": "halt",
-            "breach_cooldown_days": 2
-        },
-        "cash_balance": 100000,
-        "total_value": 100000,
-    },
-    {
-        "id": "quality_ls_fund",
-        "name": "Quality L/S",
-        "strategy": "quality_ls",
-        "description": (
-            "Fundamental long-short strategies. "
-            "Weeks to months horizon, slow-moving fundamentals + quality factors."
-        ),
-        "thesis_json": {
-            "name": "Quality Long-Short",
-            "strategy": "quality_ls",
-            "description": "Slow-moving fundamentals, valuation, quality factors",
-            "horizon_days": [20, 90],
-            "edge": "Fundamental analysis, quality factors, value spread",
+            "factors": ["earnings_yield", "fcf_yield", "roic", "leverage", "value_rank_pct"],
             "universe_spec": {
                 "type": "screen",
                 "params": {
@@ -200,12 +181,12 @@ FUNDS = [
             "vol_target": 0.12,
             "max_position_pct": 0.10,
             "max_turnover_daily": 0.10,
-            "rebalance_cadence": "weekly",
+            "rebalance_cadence": "quarterly",
             "max_positions": 30,
             "default_stop_loss_pct": 0.10,
             "default_take_profit_pct": 0.20,
             "trailing_stop": True,
-            "max_gross_exposure": 1.6,
+            "max_gross_exposure": 1.0,
             "min_cash_buffer": 0.05,
             "go_flat_on_circuit_breaker": True,
             "version": "1.0"
@@ -213,11 +194,71 @@ FUNDS = [
         "risk_limits_json": {
             "max_position_pct": 0.10,
             "max_sector_pct": 0.25,
-            "max_gross_exposure": 1.6,
-            "max_daily_loss_pct": 0.02,
-            "max_weekly_drawdown_pct": 0.05,
+            "max_gross_exposure": 1.0,
+            "max_daily_loss_pct": 0.03,
+            "max_weekly_drawdown_pct": 0.08,
             "breach_action": "reduce",
             "breach_cooldown_days": 3
+        },
+        "cash_balance": 100000,
+        "total_value": 100000,
+    },
+    {
+        "id": "low_vol_fund",
+        "name": "Defensive Low Volatility",
+        "strategy": "low_vol",
+        "description": (
+            "Defensive low volatility. "
+            "Entry: Bottom 20% vol + profitability > 0. "
+            "Exit: Vol rank > 40% OR profit < 0. "
+            "Rebalance: Monthly."
+        ),
+        "thesis_json": {
+            "name": "Defensive Low Volatility",
+            "strategy": "low_vol",
+            "description": "Low vol outperforms in drawdowns",
+            "horizon_days": [30, 120],
+            "edge": "Low vol outperforms in drawdowns",
+            "rules": {
+                "signal": "Realized volatility rank (lowest = best)",
+                "entry": "Bottom 20% vol + profitability > 0",
+                "exit": "Vol rank > 40% OR profitability < 0",
+                "sizing": "Equal weight, cap 10%",
+                "rebalance": "Monthly"
+            },
+            "factors": ["volatility_63d", "vol_rank_pct", "profitability", "beta"],
+            "universe_spec": {
+                "type": "screen",
+                "params": {
+                    "market_cap": "large",
+                    "min_adv": 10000000
+                }
+            },
+            "version": "1.0"
+        },
+        "policy_json": {
+            "sizing_method": "equal_weight",
+            "vol_target": 0.10,
+            "max_position_pct": 0.10,
+            "max_turnover_daily": 0.15,
+            "rebalance_cadence": "monthly",
+            "max_positions": 25,
+            "default_stop_loss_pct": 0.08,
+            "default_take_profit_pct": 0.15,
+            "trailing_stop": False,
+            "max_gross_exposure": 1.0,
+            "min_cash_buffer": 0.05,
+            "go_flat_on_circuit_breaker": True,
+            "version": "1.0"
+        },
+        "risk_limits_json": {
+            "max_position_pct": 0.10,
+            "max_sector_pct": 0.30,
+            "max_gross_exposure": 1.0,
+            "max_daily_loss_pct": 0.025,
+            "max_weekly_drawdown_pct": 0.06,
+            "breach_action": "reduce",
+            "breach_cooldown_days": 2
         },
         "cash_balance": 100000,
         "total_value": 100000,

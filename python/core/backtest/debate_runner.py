@@ -21,6 +21,8 @@ from pathlib import Path
 from core.data.snapshot import GlobalMarketSnapshot
 from core.backtest.portfolio_tracker import BacktestPortfolio
 from core.backtest.events import DebateMessageEvent, DecisionEvent
+from core.backtest.deidentifier import get_deidentifier
+from core.backtest.validator import DecisionValidator, ValidationResult
 
 # Import LangChain chains
 from core.langchain.chains import (
@@ -136,7 +138,7 @@ class DailyDebateRunner:
         portfolio: BacktestPortfolio,
         snapshot: GlobalMarketSnapshot,
         simulation_date: date,
-        available_trades: int = 3,
+        trade_budget: Optional["TradeBudget"] = None,  # NEW: Budget enforcement
     ) -> TradingDecision:
         """
         Run the full 3-phase debate for a fund.
@@ -148,7 +150,7 @@ class DailyDebateRunner:
             portfolio: Current portfolio state
             snapshot: Market data snapshot (point-in-time)
             simulation_date: Current simulation date
-            available_trades: How many new positions allowed
+            trade_budget: TradeBudget for enforcement (replaces available_trades)
             
         Returns:
             TradingDecision with action, reasoning, and transcript
@@ -157,9 +159,10 @@ class DailyDebateRunner:
         models_used: Dict[str, str] = {}
         total_tokens = 0
         
-        # Build context for prompts
+        # Build context for prompts (with budget constraints)
         context = self._build_context(
-            fund_name, fund_thesis, portfolio, snapshot, simulation_date
+            fund_name, fund_thesis, portfolio, snapshot, 
+            simulation_date, trade_budget
         )
         
         # Phase 1: ANALYZE (Gemini via LangChain)
@@ -178,6 +181,67 @@ class DailyDebateRunner:
         )
         models_used["decide"] = self._model_names["decide"]
         total_tokens += transcript[-1].tokens_used if transcript else 0
+        
+        # Validation gate (safety check)
+        if trade_budget and decision.symbol:
+            # Create validator
+            validator = DecisionValidator(
+                max_position_pct=0.20,  # TODO: Get from fund policy
+                allowed_features=snapshot.available_features(),
+            )
+            
+            # Validate decision
+            decision_dict = {
+                "action": decision.action,
+                "asset_id": decision.symbol,  # De-identified Asset_###
+                "target_weight": decision.target_weight,
+                "reasoning": decision.reasoning,
+                "confidence": decision.confidence,
+            }
+            
+            validation_result = validator.validate(
+                decision_dict,
+                budget=trade_budget,
+                candidates=None,  # TODO: Pass candidate set
+            )
+            
+            if not validation_result.valid:
+                logger.warning(
+                    f"[{fund_id}] Decision rejected by validator: "
+                    f"{validation_result.reason}"
+                )
+                decision = TradingDecision(
+                    action="hold",
+                    reasoning=f"Validator rejected: {validation_result.reason}",
+                    confidence=0.0,
+                )
+        
+        # Re-identify asset (convert Asset_### back to ticker)
+        if decision.symbol and decision.symbol.startswith("Asset_"):
+            deidentifier = get_deidentifier()
+            real_ticker = deidentifier.reidentify_ticker(decision.symbol)
+            if real_ticker:
+                decision.symbol = real_ticker
+            else:
+                logger.error(
+                    f"Could not re-identify {decision.symbol}, converting to HOLD"
+                )
+                decision = TradingDecision(
+                    action="hold",
+                    reasoning="Re-identification failed",
+                    confidence=0.0,
+                )
+        
+        # Budget validation gate (safety check)
+        if trade_budget and decision.action == "buy" and not trade_budget.can_buy():
+            logger.warning(
+                f"[{fund_id}] Buy decision overridden by budget gate"
+            )
+            decision = TradingDecision(
+                action="hold",
+                reasoning=f"Budget denied: {decision.reasoning}",
+                confidence=0.1,
+            )
         
         # Check if major trade needs Claude confirmation
         if decision.action != "hold" and decision.target_weight:
@@ -208,37 +272,53 @@ class DailyDebateRunner:
         portfolio: BacktestPortfolio,
         snapshot: GlobalMarketSnapshot,
         simulation_date: date,
+        trade_budget: Optional["TradeBudget"] = None,
     ) -> str:
-        """Build context string for prompts."""
-        # Portfolio summary
+        """
+        Build context string for prompts with de-identification.
+        
+        Tickers are replaced with Asset_### to prevent temporal leakage.
+        """
+        deidentifier = get_deidentifier()
+        
+        # Portfolio summary (de-identified)
         positions_str = ""
         for sym, pos in portfolio.positions.items():
+            asset_id = deidentifier.deidentify_ticker(sym)
             weight = portfolio.get_position_weight(sym)
             positions_str += (
-                f"  - {sym}: {pos.quantity:.0f} shares @ ${pos.current_price:.2f} "
-                f"({weight:.1%} of portfolio, {pos.unrealized_return:+.1%} unrealized)\n"
+                f"  - {asset_id}: {pos.quantity:.0f} shares @ "
+                f"${pos.current_price:.2f} "
+                f"({weight:.1%} of portfolio, "
+                f"{pos.unrealized_return:+.1%} unrealized)\n"
             )
         
         if not positions_str:
             positions_str = "  (No positions)\n"
         
-        # Top movers from snapshot
+        # Top movers from snapshot (de-identified)
         top_movers = []
         for sym in snapshot.prices.keys():
             ret_1d = snapshot.get_return(sym, "1d")
             if ret_1d is not None:
-                top_movers.append((sym, ret_1d))
+                asset_id = deidentifier.deidentify_ticker(sym)
+                top_movers.append((asset_id, ret_1d))
         
         top_movers.sort(key=lambda x: abs(x[1]), reverse=True)
         movers_str = "\n".join([
-            f"  - {sym}: {ret:+.1%} (1d)"
-            for sym, ret in top_movers[:10]
+            f"  - {asset_id}: {ret:+.1%} (1d)"
+            for asset_id, ret in top_movers[:10]
         ])
         
+        # Note: We removed the explicit date and use "Day N" notation
+        # to reduce temporal leakage
         context = f"""
 FUND: {fund_name}
-DATE: {simulation_date.isoformat()}
 THESIS: {fund_thesis}
+
+IMPORTANT: Asset identifiers are de-identified (Asset_###).
+You may ONLY use numeric features provided. Do NOT reference company
+names, products, brands, or external knowledge.
 
 PORTFOLIO STATE:
   Total Value: ${portfolio.total_value:,.2f}
@@ -252,10 +332,15 @@ TOP MARKET MOVERS (1-day):
 {movers_str}
 
 AVAILABLE DATA:
-  - Prices for {len(snapshot.prices)} symbols
+  - Prices for {len(snapshot.prices)} de-identified assets
   - Returns: 1d, 5d, 21d, 63d
   - Volatility: 5d, 21d
 """
+        
+        # Add trade budget constraints if provided
+        if trade_budget:
+            context += "\n" + trade_budget.to_context_string()
+        
         return context
     
     async def _phase_analyze(

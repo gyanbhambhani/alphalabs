@@ -6,10 +6,12 @@ Key principles:
 - RiskCheckResult with scale_factor and detailed violations
 - Quantity-based go_flat (no stale prices)
 - Uses FundRiskStateRepo for cooldown tracking
+- Vol-based position sizing for strategy-aware controls
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
+import numpy as np
 
 from core.config.constants import CONSTANTS
 from core.execution.risk_repo import FundRiskState, FundRiskStateRepo
@@ -118,6 +120,88 @@ class RiskManager:
             risk_state_repo: Repository for fund risk state (cooldowns, P&L)
         """
         self.risk_state_repo = risk_state_repo
+    
+    def compute_vol_based_position_size(
+        self,
+        base_weight: float,
+        asset_vol: float,
+        target_portfolio_vol: float,
+        max_position_cap: float,
+    ) -> float:
+        """
+        Compute vol-adjusted position size (risk parity).
+        
+        Position size scales inversely with asset volatility:
+        size = min(cap, base_weight * (target_vol / asset_vol))
+        
+        Args:
+            base_weight: Base position weight (e.g., 0.10)
+            asset_vol: Asset 21d volatility (annualized)
+            target_portfolio_vol: Target portfolio vol (e.g., 0.15)
+            max_position_cap: Hard cap (e.g., 0.15)
+            
+        Returns:
+            Vol-adjusted position size
+        """
+        if asset_vol <= 0:
+            return max_position_cap
+        
+        # Risk parity scaling
+        vol_adjusted = base_weight * (target_portfolio_vol / asset_vol)
+        
+        # Apply cap
+        return min(vol_adjusted, max_position_cap)
+    
+    def compute_strategy_limits(
+        self,
+        strategy: str,
+        realized_vol: float,
+    ) -> Dict[str, float]:
+        """
+        Compute strategy-specific risk limits based on realized vol.
+        
+        Different strategies need different risk controls:
+        - Momentum: moderate drawdown tolerance
+        - Mean reversion: tighter stops, shorter horizon
+        - Value: higher drawdown tolerance
+        
+        Args:
+            strategy: Strategy name
+            realized_vol: Realized portfolio volatility
+            
+        Returns:
+            Dict with computed limits
+        """
+        # Base multipliers by strategy
+        if strategy == "momentum":
+            daily_loss_mult = 2.5
+            weekly_dd_mult = 3.5
+            stop_mult = 2.5
+        elif strategy == "mean_reversion":
+            daily_loss_mult = 2.0
+            weekly_dd_mult = 3.0
+            stop_mult = 2.0
+        elif strategy in ["value", "quality_ls"]:
+            daily_loss_mult = 2.5
+            weekly_dd_mult = 4.0
+            stop_mult = 3.0
+        elif strategy == "low_vol":
+            daily_loss_mult = 2.0
+            weekly_dd_mult = 3.0
+            stop_mult = 2.0
+        else:
+            daily_loss_mult = 2.5
+            weekly_dd_mult = 3.5
+            stop_mult = 2.5
+        
+        # Compute limits from realized vol
+        expected_daily_vol = realized_vol / np.sqrt(252)
+        
+        return {
+            "max_daily_loss_pct": daily_loss_mult * expected_daily_vol,
+            "max_weekly_drawdown_pct": weekly_dd_mult * expected_daily_vol,
+            "stop_loss_pct": stop_mult * expected_daily_vol,
+        }
     
     def check_intent(
         self,

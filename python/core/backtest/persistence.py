@@ -290,6 +290,184 @@ class BacktestPersistence:
             
         return decision_id
     
+    def save_decision_candidates(
+        self,
+        decision_id: str,
+        run_id: str,
+        candidates: List[Dict],
+    ) -> List[str]:
+        """
+        Save candidate assets considered for a decision.
+        
+        Args:
+            decision_id: Decision this relates to
+            run_id: Backtest run ID
+            candidates: List of candidate dicts with:
+                - symbol: str
+                - sector: str (optional)
+                - selected: bool
+                - features: Dict[str, float]
+                - scores: Dict[str, float] (optional)
+                - target_weight: float (optional, if selected)
+                
+        Returns:
+            List of candidate IDs created
+        """
+        candidate_ids = []
+        
+        with self.get_session() as session:
+            for candidate in candidates:
+                candidate_id = str(uuid.uuid4())[:12]
+                
+                record = BacktestDecisionCandidate(
+                    id=candidate_id,
+                    decision_id=decision_id,
+                    run_id=run_id,
+                    symbol=candidate["symbol"],
+                    sector=candidate.get("sector"),
+                    selected=candidate.get("selected", False),
+                    features=candidate["features"],
+                    scores=candidate.get("scores"),
+                    target_weight=candidate.get("target_weight"),
+                    created_at=datetime.utcnow(),
+                )
+                session.add(record)
+                candidate_ids.append(candidate_id)
+            
+            session.commit()
+        
+        return candidate_ids
+    
+    def save_experience_record(
+        self,
+        decision_id: str,
+        run_id: str,
+        fund_id: str,
+        feature_vector: List[float],
+        action: str,
+        symbol: Optional[str] = None,
+        weight: Optional[float] = None,
+        regime: Optional[str] = None,
+        decision_date: Optional[date] = None,
+    ) -> str:
+        """
+        Save an experience record for retrieval/learning.
+        
+        Outcomes should be filled in post-hoc via update_experience_outcomes().
+        
+        Args:
+            decision_id: Decision ID
+            run_id: Backtest run ID
+            fund_id: Fund ID
+            feature_vector: Normalized feature vector (list of floats)
+            action: "buy", "sell", or "hold"
+            symbol: Asset symbol (if not hold)
+            weight: Position weight (if not hold)
+            regime: Market regime label
+            decision_date: Date of decision
+            
+        Returns:
+            Experience record ID
+        """
+        experience_id = str(uuid.uuid4())[:12]
+        
+        with self.get_session() as session:
+            record = ExperienceRecord(
+                id=experience_id,
+                decision_id=decision_id,
+                run_id=run_id,
+                fund_id=fund_id,
+                feature_vector=feature_vector,
+                action=action,
+                symbol=symbol,
+                weight=weight,
+                regime=regime,
+                decision_date=decision_date or date.today(),
+                created_at=datetime.utcnow(),
+            )
+            session.add(record)
+            session.commit()
+        
+        return experience_id
+    
+    def update_candidate_outcomes(
+        self,
+        candidate_id: str,
+        outcome_1d: Optional[float] = None,
+        outcome_5d: Optional[float] = None,
+        outcome_21d: Optional[float] = None,
+        outcome_63d: Optional[float] = None,
+        realized_pnl: Optional[float] = None,
+        realized_return: Optional[float] = None,
+        holding_days: Optional[int] = None,
+    ) -> None:
+        """Update candidate with realized outcomes (post-hoc)."""
+        with self.get_session() as session:
+            candidate = session.query(BacktestDecisionCandidate).filter_by(
+                id=candidate_id
+            ).first()
+            
+            if candidate:
+                if outcome_1d is not None:
+                    candidate.outcome_1d = outcome_1d
+                if outcome_5d is not None:
+                    candidate.outcome_5d = outcome_5d
+                if outcome_21d is not None:
+                    candidate.outcome_21d = outcome_21d
+                if outcome_63d is not None:
+                    candidate.outcome_63d = outcome_63d
+                if realized_pnl is not None:
+                    candidate.realized_pnl = realized_pnl
+                if realized_return is not None:
+                    candidate.realized_return = realized_return
+                if holding_days is not None:
+                    candidate.holding_days = holding_days
+                
+                session.commit()
+    
+    def update_experience_outcomes(
+        self,
+        experience_id: str,
+        outcome_5d: Optional[float] = None,
+        outcome_21d: Optional[float] = None,
+        outcome_63d: Optional[float] = None,
+        realized_commission: Optional[float] = None,
+        realized_slippage_bps: Optional[float] = None,
+        max_drawdown: Optional[float] = None,
+        realized_vol: Optional[float] = None,
+        win: Optional[bool] = None,
+        alpha_vs_spy: Optional[float] = None,
+    ) -> None:
+        """Update experience record with realized outcomes (post-hoc)."""
+        with self.get_session() as session:
+            record = session.query(ExperienceRecord).filter_by(
+                id=experience_id
+            ).first()
+            
+            if record:
+                if outcome_5d is not None:
+                    record.outcome_5d = outcome_5d
+                if outcome_21d is not None:
+                    record.outcome_21d = outcome_21d
+                    # Auto-determine win
+                    record.win = outcome_21d > 0
+                if outcome_63d is not None:
+                    record.outcome_63d = outcome_63d
+                if realized_commission is not None:
+                    record.realized_commission = realized_commission
+                if realized_slippage_bps is not None:
+                    record.realized_slippage_bps = realized_slippage_bps
+                if max_drawdown is not None:
+                    record.max_drawdown = max_drawdown
+                if realized_vol is not None:
+                    record.realized_vol = realized_vol
+                if win is not None:
+                    record.win = win
+                if alpha_vs_spy is not None:
+                    record.alpha_vs_spy = alpha_vs_spy
+                
+                session.commit()
+    
     # =========================================================================
     # Snapshot Recording
     # =========================================================================
