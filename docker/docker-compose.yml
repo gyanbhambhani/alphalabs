@@ -37,17 +37,32 @@ services:
       DATABASE_URL: postgresql://trading:trading_password@postgres:5432/trading_lab
       REDIS_URL: redis://redis:6379
       DEBUG: "true"
-      # Add API keys via .env file
+      # Logging configuration
+      LOG_LEVEL: INFO
+      LOG_FORMAT: colored
+      PYTHONUNBUFFERED: "1"
     env_file:
-      - ../.env
+      - ../.env.local
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
+      # Mount source code for hot-reload
       - ../python:/app
-      - chroma_data:/app/chroma_data
+      # Mount existing ChromaDB data (your embeddings)
+      - ../python/chroma_data:/app/chroma_data
+      # Persist backtest cache
+      - ../python/data:/app/data
+    # Logging driver - show logs in docker logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # Restart on failure
+    restart: unless-stopped
 
-  # Frontend (Next.js) - for local development
+  # Frontend (Next.js) - Development mode
   frontend:
     build:
       context: ../frontend
@@ -56,10 +71,23 @@ services:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
     depends_on:
       - api
+    volumes:
+      # Mount source code for hot-reload
+      - ../frontend:/app
+      # Don't mount node_modules (use container's)
+      - /app/node_modules
+      - /app/.next
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "2"
+    restart: unless-stopped
 
 volumes:
   postgres_data:
   redis_data:
-  chroma_data:

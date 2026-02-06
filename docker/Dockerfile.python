@@ -18,5 +18,10 @@ COPY python/ .
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Environment variables for logging
+ENV PYTHONUNBUFFERED=1
+ENV LOG_LEVEL=INFO
+ENV LOG_FORMAT=colored
+
+# Run the application with hot-reload for development
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

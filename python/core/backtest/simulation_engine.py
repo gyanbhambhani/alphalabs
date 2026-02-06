@@ -19,6 +19,16 @@ from dataclasses import dataclass, field
 import logging
 import time
 
+# Import centralized logging helpers
+try:
+    from app.logging_config import exec_log, trade_log
+except ImportError:
+    # Fallback if logging_config not available
+    def exec_log(msg: str, level: int = logging.INFO, **kwargs):
+        logging.getLogger("execution").log(level, f"[EXEC] {msg}", **kwargs)
+    def trade_log(msg: str, level: int = logging.INFO, **kwargs):
+        logging.getLogger("trade").log(level, f"[TRADE] {msg}", **kwargs)
+
 from core.backtest.data_loader import HistoricalDataLoader
 from core.backtest.snapshot_builder import PointInTimeSnapshotBuilder
 from core.backtest.portfolio_tracker import BacktestPortfolio, BacktestTrade
@@ -325,11 +335,17 @@ class SimulationEngine:
         price = snapshot.get_price(symbol)
         
         if price is None:
+            exec_log(f"Price check FAILED: No price for {symbol}", level=logging.WARNING)
             return False, f"No price available for {symbol}"
         
         if price <= 0:
+            exec_log(
+                f"Price check FAILED: Invalid price ${price} for {symbol}",
+                level=logging.WARNING
+            )
             return False, f"Invalid price {price} for {symbol}"
         
+        exec_log(f"Price check: ${price:.2f} OK")
         return True, ""
     
     def _should_execute_buy(
@@ -362,6 +378,9 @@ class SimulationEngine:
         reasons: List[str] = []
         current_weight = portfolio.get_position_weight(symbol)
         
+        exec_log(f"Validating buy for {symbol}...")
+        exec_log(f"Position check: current={current_weight:.1%}, target={target_weight:.1%}")
+        
         # Guard 1: Already at or above target
         if current_weight >= target_weight:
             reasons.append(
@@ -374,6 +393,11 @@ class SimulationEngine:
             reasons.append(f"Delta {delta:.1%} below threshold")
         
         # Guard 3: Max concentration
+        exec_log(
+            f"Concentration check: {target_weight:.1%} <= "
+            f"{MAX_SINGLE_POSITION_WEIGHT:.1%} max "
+            f"{'OK' if target_weight <= MAX_SINGLE_POSITION_WEIGHT else 'FAIL'}"
+        )
         if target_weight > MAX_SINGLE_POSITION_WEIGHT:
             reasons.append(
                 f"Target {target_weight:.1%} exceeds max "
@@ -386,13 +410,21 @@ class SimulationEngine:
             current_value = portfolio.total_value * current_weight
             buy_value = target_value - current_value
             buy_qty = int(buy_value / price)
+            exec_log(f"Quantity check: buy_qty={buy_qty} shares {'OK' if buy_qty > 0 else 'FAIL'}")
             if buy_qty <= 0:
                 reasons.append(f"Computed buy quantity {buy_qty} <= 0")
         
-        return ExecutionBlockResult(
+        result = ExecutionBlockResult(
             can_execute=len(reasons) == 0,
             block_reasons=reasons,
         )
+        
+        if result.can_execute:
+            exec_log("All buy guards PASSED")
+        else:
+            exec_log(f"Buy guards FAILED: {reasons}", level=logging.WARNING)
+        
+        return result
     
     def _should_execute_sell(
         self,
@@ -421,13 +453,21 @@ class SimulationEngine:
         """
         reasons: List[str] = []
         
+        exec_log(f"Validating sell for {symbol}...")
+        
         # Guard 1: Don't hold the symbol
         if symbol not in portfolio.positions:
             reasons.append(f"Cannot sell {symbol} - not in portfolio")
+            exec_log(f"Sell BLOCKED: {symbol} not in portfolio", level=logging.WARNING)
             return ExecutionBlockResult(can_execute=False, block_reasons=reasons)
         
         position = portfolio.positions[symbol]
         current_weight = portfolio.get_position_weight(symbol)
+        
+        exec_log(
+            f"Position: {position.quantity:.0f} shares, "
+            f"current={current_weight:.1%}, target={target_weight:.1%}"
+        )
         
         # Guard 2: Current shares <= 0
         if position.quantity <= 0:
@@ -447,15 +487,27 @@ class SimulationEngine:
             current_value = position.quantity * price
             sell_value = current_value - target_value
             sell_qty = int(sell_value / price)
+            exec_log(
+                f"Quantity check: sell_qty={sell_qty} <= "
+                f"held_qty={position.quantity} "
+                f"{'OK' if sell_qty <= position.quantity else 'FAIL'}"
+            )
             if sell_qty > position.quantity:
                 reasons.append(
                     f"Sell qty {sell_qty} > held qty {position.quantity}"
                 )
         
-        return ExecutionBlockResult(
+        result = ExecutionBlockResult(
             can_execute=len(reasons) == 0,
             block_reasons=reasons,
         )
+        
+        if result.can_execute:
+            exec_log("All sell guards PASSED")
+        else:
+            exec_log(f"Sell guards FAILED: {reasons}", level=logging.WARNING)
+        
+        return result
     
     def _check_churn_guard(
         self,
@@ -495,12 +547,20 @@ class SimulationEngine:
         min_days = MIN_HOLDING_DAYS.get(strategy_key, 5)
         
         days_held = (current_date - last_date).days
+        exec_log(
+            f"Churn guard: {symbol} held {days_held}d, "
+            f"min hold {min_days}d for {strategy_key}"
+        )
+        
         if days_held < min_days:
-            return False, (
+            reason = (
                 f"Churn guard: {symbol} bought {days_held}d ago, "
                 f"min hold {min_days}d for {strategy_key}"
             )
+            exec_log(f"Churn guard BLOCKED: {reason}", level=logging.WARNING)
+            return False, reason
         
+        exec_log("Churn guard PASSED")
         return True, ""
     
     def _record_trade(
@@ -1042,6 +1102,12 @@ class SimulationEngine:
                     reasoning=decision.reasoning,
                 )
                 
+                # Log the trade
+                trade_log(
+                    f"BUY {quantity} {decision.symbol} @ ${price:.2f} = "
+                    f"${quantity * price:,.2f} (commission: ${commission:.2f})"
+                )
+                
                 # Record trade entry for outcome tracking
                 decision_id = f"{self.run_id}_{fund.fund_id}_{current_date.isoformat()}"
                 predicted_direction = "up"  # Buy implies expecting price to go up
@@ -1145,6 +1211,12 @@ class SimulationEngine:
                     commission=commission,
                     timestamp=datetime.combine(current_date, datetime.min.time()),
                     reasoning=decision.reasoning,
+                )
+                
+                # Log the trade
+                trade_log(
+                    f"SELL {quantity} {decision.symbol} @ ${price:.2f} = "
+                    f"${quantity * price:,.2f} (commission: ${commission:.2f})"
                 )
                 
                 # Generate decision_id for sell

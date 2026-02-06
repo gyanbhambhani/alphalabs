@@ -1,10 +1,12 @@
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, Query
+import time
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from typing import Optional
+import logging
 
 # Load environment variables FIRST before anything else
 from dotenv import load_dotenv
@@ -14,10 +16,12 @@ env_local = project_root / ".env.local"
 env_file = project_root / ".env"
 if env_local.exists():
     load_dotenv(env_local)
-    print(f"Loaded environment from {env_local}")
 elif env_file.exists():
     load_dotenv(env_file)
-    print(f"Loaded environment from {env_file}")
+
+# Setup logging AFTER env vars loaded
+from app.logging_config import setup_logging
+setup_logging()
 
 from app.config import get_settings
 from app.schemas import (
@@ -37,6 +41,7 @@ from app.backtest_routes import router as backtest_router
 from app.replay_routes import router as replay_router
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.app_name,
@@ -52,6 +57,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests with timing."""
+    start_time = time.time()
+    
+    # Skip logging for health checks and static files
+    path = request.url.path
+    skip_paths = ["/health", "/docs", "/openapi.json", "/favicon.ico"]
+    
+    if any(path.startswith(p) for p in skip_paths):
+        return await call_next(request)
+    
+    # Log request
+    logger.info(f"[API] {request.method} {path}")
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Log response with timing
+    duration_ms = (time.time() - start_time) * 1000
+    status = response.status_code
+    
+    if status >= 400:
+        logger.warning(f"[API] {request.method} {path} -> {status} ({duration_ms:.0f}ms)")
+    else:
+        logger.info(f"[API] {request.method} {path} -> {status} ({duration_ms:.0f}ms)")
+    
+    return response
+
 
 # Include routes
 app.include_router(backtest_router)

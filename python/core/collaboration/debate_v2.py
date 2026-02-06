@@ -19,8 +19,19 @@ from datetime import date
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple, Any
 import math
+import logging
 
 from core.data.snapshot import GlobalMarketSnapshot
+
+# Import centralized logging helpers
+try:
+    from app.logging_config import consensus_log
+except ImportError:
+    # Fallback if logging_config not available
+    def consensus_log(msg: str, level: int = logging.INFO, **kwargs):
+        logging.getLogger("consensus").log(level, f"[CONSENSUS] {msg}", **kwargs)
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -96,37 +107,81 @@ def validate_thesis_against_strategy(
     
     Args:
         thesis_type: The thesis type proposed by the agent
-        fund_strategy: The fund's strategy string
+        fund_strategy: The fund's strategy string (can be descriptive)
         
     Returns:
         Tuple of (is_valid, reason_if_invalid)
     """
-    # Normalize: "Mean Reversion Fund" -> "mean_reversion"
-    strategy_key = fund_strategy.lower().replace(" ", "_")
-    for suffix in ["_fund", "_sleeve"]:
-        if strategy_key.endswith(suffix):
-            strategy_key = strategy_key[:-len(suffix)]
+    strategy_lower = fund_strategy.lower()
+    
+    # Try to detect strategy from descriptive text
+    # Check for keywords that indicate strategy type
+    strategy_key = None
+    
+    # Direct matches first
+    for key in STRATEGY_TO_THESIS_TYPES.keys():
+        if key in strategy_lower.replace(" ", "_"):
+            strategy_key = key
+            break
+    
+    # Keyword detection for descriptive thesis strings
+    if strategy_key is None:
+        if any(kw in strategy_lower for kw in ["momentum", "12-month", "trend"]):
+            strategy_key = "momentum"
+        elif any(kw in strategy_lower for kw in [
+            "mean_reversion", "mean reversion", "oversold", "rsi", "revert"
+        ]):
+            strategy_key = "mean_reversion"
+        elif any(kw in strategy_lower for kw in ["volatility", "vol", "vix"]):
+            strategy_key = "volatility"
+        elif any(kw in strategy_lower for kw in [
+            "value", "undervalued", "p/e", "pe ratio", "fundamentals"
+        ]):
+            strategy_key = "value"
+        elif any(kw in strategy_lower for kw in ["quality", "quality_ls"]):
+            strategy_key = "quality_ls"
+        elif any(kw in strategy_lower for kw in ["event", "catalyst"]):
+            strategy_key = "event_driven"
+        elif any(kw in strategy_lower for kw in ["macro", "trend_macro"]):
+            strategy_key = "trend_macro"
     
     # Fallback: first word
-    if strategy_key not in STRATEGY_TO_THESIS_TYPES:
-        strategy_key = fund_strategy.lower().split()[0]
+    if strategy_key is None:
+        first_word = fund_strategy.lower().split()[0]
+        if first_word in STRATEGY_TO_THESIS_TYPES:
+            strategy_key = first_word
     
-    allowed = STRATEGY_TO_THESIS_TYPES.get(strategy_key)
+    allowed = STRATEGY_TO_THESIS_TYPES.get(strategy_key) if strategy_key else None
     
     if allowed is None:
-        return False, f"Unknown fund strategy '{fund_strategy}'"
+        logger.debug(
+            f"[CONSENSUS] Unknown fund strategy '{fund_strategy[:50]}...' "
+            f"(detected: {strategy_key})"
+        )
+        return False, f"Unknown fund strategy '{fund_strategy[:50]}...'"
     
     if not allowed:
+        logger.debug(
+            f"[CONSENSUS] Fund strategy '{strategy_key}' disabled - "
+            f"no supported thesis types"
+        )
         return False, (
-            f"Fund strategy '{fund_strategy}' disabled - no supported thesis types"
+            f"Fund strategy '{strategy_key}' disabled - no supported thesis types"
         )
     
     if thesis_type not in allowed:
+        logger.debug(
+            f"[CONSENSUS] Thesis '{thesis_type.value}' not allowed for "
+            f"'{strategy_key}'. Allowed: {[t.value for t in allowed]}"
+        )
         return False, (
-            f"Thesis '{thesis_type.value}' not allowed for '{fund_strategy}'. "
+            f"Thesis '{thesis_type.value}' not allowed for '{strategy_key}'. "
             f"Allowed: {[t.value for t in allowed]}"
         )
     
+    logger.debug(
+        f"[CONSENSUS] Thesis '{thesis_type.value}' OK for '{strategy_key}'"
+    )
     return True, ""
 
 # Interpretation templates per thesis (for documentation/UI)
@@ -513,17 +568,19 @@ class ConsensusGate:
     
     All gates must pass for execution. LLM alignment score is for UX only.
     
-    V2.1.2 - Strict gates:
+    V2.2 - Data-first gates:
+    - symbol_in_candidates: NEW - must pick from pre-screened list
     - symbol_match: STRICT - must match for non-hold
     - min_confidence_met: >= 0.5 (restored)
     - min_edge_met: >= 0.6 (restored)
-    - fund_strategy_match: NEW - thesis must match fund mandate
+    - fund_strategy_match: thesis must match fund mandate
     """
     # Hard requirements
     action_match: bool = False
     symbol_match: bool = False              # STRICT: must match for non-hold
+    symbol_in_candidates: bool = True       # NEW V2.2: must be in screened list
     thesis_type_match: bool = False
-    fund_strategy_match: bool = False       # NEW: thesis matches fund mandate
+    fund_strategy_match: bool = False       # thesis matches fund mandate
     horizon_within_tolerance: bool = False  # Bucket-based (short/medium/long)
     invalidation_compatible: bool = False   # At least one has rules
     min_confidence_met: bool = False        # All components >= 0.5 (restored)
@@ -543,6 +600,7 @@ class ConsensusGate:
         return all([
             self.action_match,
             self.symbol_match,
+            self.symbol_in_candidates,       # NEW V2.2
             self.thesis_type_match,
             self.fund_strategy_match,
             self.horizon_within_tolerance,
@@ -562,6 +620,7 @@ class ConsensusGate:
         gates = {
             "action_match": self.action_match,
             "symbol_match": self.symbol_match,
+            "symbol_in_candidates": self.symbol_in_candidates,  # NEW V2.2
             "thesis_type_match": self.thesis_type_match,
             "fund_strategy_match": self.fund_strategy_match,
             "horizon_within_tolerance": self.horizon_within_tolerance,
@@ -582,6 +641,7 @@ class ConsensusGate:
         gates = {
             "action_match": self.action_match,
             "symbol_match": self.symbol_match,
+            "symbol_in_candidates": self.symbol_in_candidates,  # NEW V2.2
             "thesis_type_match": self.thesis_type_match,
             "fund_strategy_match": self.fund_strategy_match,
             "horizon_within_tolerance": self.horizon_within_tolerance,
@@ -920,6 +980,7 @@ def compute_consensus_gate(
     turn_b: AgentTurn,
     snapshot: GlobalMarketSnapshot,
     fund_strategy: str = "",
+    valid_symbols: Optional[Set[str]] = None,
 ) -> ConsensusGate:
     """
     Compute all gate checks deterministically with strict thresholds.
@@ -931,17 +992,23 @@ def compute_consensus_gate(
         turn_b: Second agent's turn
         snapshot: Current market snapshot
         fund_strategy: Fund's strategy for thesis validation
+        valid_symbols: Set of pre-screened valid symbols (if provided)
         
     Returns:
         ConsensusGate with all checks computed
     """
     rejection_reasons: List[str] = []
     
+    logger.debug("[CONSENSUS] Computing consensus gate...")
+    
     # Action match
     action_match = turn_a.action == turn_b.action
     if not action_match:
         rejection_reasons.append(
             f"Action mismatch: {turn_a.action} vs {turn_b.action}"
+        )
+        logger.debug(
+            f"[CONSENSUS] action_match=False ({turn_a.action} vs {turn_b.action})"
         )
     
     # Symbol match - STRICT for non-hold
@@ -953,6 +1020,35 @@ def compute_consensus_gate(
             rejection_reasons.append(
                 f"Symbol mismatch: {turn_a.symbol} vs {turn_b.symbol}"
             )
+            logger.debug(
+                f"[CONSENSUS] symbol_match=False "
+                f"({turn_a.symbol} vs {turn_b.symbol})"
+            )
+    
+    # Symbol in screened candidates - NEW V2.2
+    symbol_in_candidates = True
+    if valid_symbols and turn_a.action != "hold":
+        sym_a = turn_a.symbol
+        sym_b = turn_b.symbol
+        a_valid = sym_a in valid_symbols if sym_a else False
+        b_valid = sym_b in valid_symbols if sym_b else False
+        
+        if not a_valid:
+            rejection_reasons.append(
+                f"Analyst symbol {sym_a} not in screened candidates"
+            )
+            symbol_in_candidates = False
+        if not b_valid:
+            rejection_reasons.append(
+                f"Critic symbol {sym_b} not in screened candidates"
+            )
+            symbol_in_candidates = False
+        
+        if not symbol_in_candidates:
+            logger.debug(
+                f"[CONSENSUS] symbol_in_candidates=False "
+                f"(valid: {valid_symbols}, got: {sym_a}, {sym_b})"
+            )
     
     # Thesis type match
     thesis_type_match = (
@@ -962,6 +1058,11 @@ def compute_consensus_gate(
         rejection_reasons.append(
             f"Thesis mismatch: {turn_a.thesis.thesis_type.value} vs "
             f"{turn_b.thesis.thesis_type.value}"
+        )
+        logger.debug(
+            f"[CONSENSUS] thesis_type_match=False "
+            f"({turn_a.thesis.thesis_type.value} vs "
+            f"{turn_b.thesis.thesis_type.value})"
         )
     
     # Fund strategy match - NEW
@@ -979,6 +1080,10 @@ def compute_consensus_gate(
                 rejection_reasons.append(f"Analyst: {reason_a}")
             if not valid_b:
                 rejection_reasons.append(f"Critic: {reason_b}")
+            logger.debug(
+                f"[CONSENSUS] fund_strategy_match=False "
+                f"(analyst={valid_a}, critic={valid_b})"
+            )
     
     # Horizon within tolerance - use buckets
     def horizon_bucket(days: int) -> str:
@@ -996,6 +1101,10 @@ def compute_consensus_gate(
         rejection_reasons.append(
             f"Horizon mismatch: {turn_a.thesis.horizon_days}d ({bucket_a}) vs "
             f"{turn_b.thesis.horizon_days}d ({bucket_b})"
+        )
+        logger.debug(
+            f"[CONSENSUS] horizon_within_tolerance=False "
+            f"({bucket_a} vs {bucket_b})"
         )
     
     # Invalidation compatible
@@ -1023,6 +1132,10 @@ def compute_consensus_gate(
         rejection_reasons.append(
             f"Confidence too low: {min_conf_a:.2f}, {min_conf_b:.2f} (need >= 0.5)"
         )
+        logger.debug(
+            f"[CONSENSUS] min_confidence_met=False "
+            f"({min_conf_a:.2f}, {min_conf_b:.2f})"
+        )
     
     # Evidence validated
     valid_a, errors_a = validate_evidence(
@@ -1041,6 +1154,10 @@ def compute_consensus_gate(
             rejection_reasons.append(f"Analyst evidence: {errors_a}")
         if errors_b:
             rejection_reasons.append(f"Critic evidence: {errors_b}")
+        logger.debug(
+            f"[CONSENSUS] evidence_validated=False "
+            f"(analyst={valid_a}, critic={valid_b})"
+        )
     
     # Min edge (signal_strength >= 0.6) - RESTORED
     min_edge_met = (
@@ -1052,10 +1169,16 @@ def compute_consensus_gate(
             f"Edge too low: {turn_a.confidence.signal_strength:.2f}, "
             f"{turn_b.confidence.signal_strength:.2f} (need >= 0.6)"
         )
+        logger.debug(
+            f"[CONSENSUS] min_edge_met=False "
+            f"({turn_a.confidence.signal_strength:.2f}, "
+            f"{turn_b.confidence.signal_strength:.2f})"
+        )
     
-    return ConsensusGate(
+    gate = ConsensusGate(
         action_match=action_match,
         symbol_match=symbol_match,
+        symbol_in_candidates=symbol_in_candidates,  # NEW V2.2
         thesis_type_match=thesis_type_match,
         fund_strategy_match=fund_strategy_match,
         horizon_within_tolerance=horizon_within_tolerance,
@@ -1065,6 +1188,19 @@ def compute_consensus_gate(
         min_edge_met=min_edge_met,
         rejection_reasons=rejection_reasons,
     )
+    
+    # Log summary
+    if gate.is_executable():
+        logger.debug(
+            f"[CONSENSUS] Gate PASSED - all {len(gate.passed_gates())} checks OK"
+        )
+    else:
+        logger.debug(
+            f"[CONSENSUS] Gate FAILED - {len(gate.failed_gates())} failed: "
+            f"{gate.failed_gates()}"
+        )
+    
+    return gate
 
 
 # =============================================================================
@@ -1077,6 +1213,7 @@ def update_consensus_board(
     turn_b: AgentTurn,
     snapshot: GlobalMarketSnapshot,
     fund_strategy: str = "",
+    valid_symbols: Optional[Set[str]] = None,
 ) -> ConsensusBoard:
     """
     Update consensus board deterministically from agent turns.
@@ -1090,12 +1227,15 @@ def update_consensus_board(
         turn_b: Second agent's turn
         snapshot: Current market snapshot
         fund_strategy: Fund's strategy for thesis validation
+        valid_symbols: Set of pre-screened valid symbols (V2.2)
         
     Returns:
         Updated ConsensusBoard
     """
     # Compute deterministic gate
-    gate = compute_consensus_gate(turn_a, turn_b, snapshot, fund_strategy)
+    gate = compute_consensus_gate(
+        turn_a, turn_b, snapshot, fund_strategy, valid_symbols
+    )
     
     # Compute agreed items
     agreed_action = turn_a.action if gate.action_match else None

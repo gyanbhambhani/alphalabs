@@ -8,7 +8,7 @@ import os
 import json
 import asyncio
 from datetime import date, datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
@@ -17,8 +17,10 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 
+# Use centralized logging
+from app.logging_config import debate_log, signals_log, consensus_log
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 # Load environment variables
 try:
@@ -642,21 +644,205 @@ class DecisionAuditTrail:
     validation_report: Dict[str, Any]  # {passed, errors, missing_required, ...}
 
 
+@dataclass
+class ScreenedCandidate:
+    """A stock candidate that passed screening with its signals."""
+    symbol: str
+    score: float  # Composite score for ranking
+    signals: Dict[str, float]  # All available signals
+    thesis_fit: str  # Which thesis type it fits best
+    reasoning: str  # Why it was selected
+
+
+def screen_universe_for_strategy(
+    snapshot: GlobalMarketSnapshot,
+    strategy: str,
+    portfolio: BacktestPortfolio,
+    top_k: int = 5,
+) -> List[ScreenedCandidate]:
+    """
+    Screen the entire universe and return top candidates for a strategy.
+    
+    This is DATA-FIRST: we look at actual numbers, not LLM guesses.
+    
+    Args:
+        snapshot: Market data with all symbols
+        strategy: Fund strategy (momentum, mean_reversion, volatility)
+        portfolio: Current portfolio (to exclude existing positions)
+        top_k: Number of candidates to return
+        
+    Returns:
+        List of ScreenedCandidate sorted by score (best first)
+    """
+    candidates: List[ScreenedCandidate] = []
+    
+    # Get all symbols with data
+    symbols = list(snapshot.prices.keys())
+    
+    # Determine which signals to use based on strategy
+    strategy_lower = strategy.lower()
+    
+    if "momentum" in strategy_lower or "trend" in strategy_lower:
+        # Momentum: look for strong positive returns over 21d and 63d
+        thesis_fit = "momentum"
+        for symbol in symbols:
+            ret_21d = snapshot.get_return(symbol, "21d")
+            ret_63d = snapshot.get_return(symbol, "63d")
+            ret_5d = snapshot.get_return(symbol, "5d")
+            vol_21d = snapshot.get_volatility(symbol, "21d")
+            price = snapshot.get_price(symbol)
+            
+            if ret_21d is None or ret_63d is None or price is None:
+                continue
+            
+            # Skip if already held
+            if symbol in portfolio.positions:
+                continue
+            
+            # Momentum score: positive returns, skip recent month effect
+            # Higher 63d return + positive 21d = strong momentum
+            score = (ret_63d * 0.6) + (ret_21d * 0.4)
+            
+            # Penalize high volatility slightly
+            if vol_21d and vol_21d > 0.4:
+                score *= 0.8
+            
+            if score > 0.02:  # Only consider positive momentum
+                candidates.append(ScreenedCandidate(
+                    symbol=symbol,
+                    score=score,
+                    signals={
+                        "return_21d": ret_21d,
+                        "return_63d": ret_63d,
+                        "return_5d": ret_5d or 0,
+                        "volatility_21d": vol_21d or 0,
+                        "price": price,
+                    },
+                    thesis_fit=thesis_fit,
+                    reasoning=(
+                        f"Strong momentum: 63d={ret_63d:+.1%}, 21d={ret_21d:+.1%}"
+                    ),
+                ))
+    
+    elif "mean_reversion" in strategy_lower or "oversold" in strategy_lower:
+        # Mean reversion: look for oversold stocks (negative short-term returns)
+        thesis_fit = "mean_reversion"
+        for symbol in symbols:
+            ret_1d = snapshot.get_return(symbol, "1d")
+            ret_5d = snapshot.get_return(symbol, "5d")
+            ret_21d = snapshot.get_return(symbol, "21d")
+            vol_21d = snapshot.get_volatility(symbol, "21d")
+            price = snapshot.get_price(symbol)
+            
+            if ret_1d is None or ret_5d is None or price is None:
+                continue
+            
+            # Skip if already held
+            if symbol in portfolio.positions:
+                continue
+            
+            # Mean reversion score: negative short-term returns = oversold
+            # More negative = higher score (potential bounce)
+            score = -(ret_1d * 0.4 + ret_5d * 0.6)
+            
+            # Only consider if actually oversold
+            if ret_5d < -0.02 or ret_1d < -0.01:
+                # Bonus if longer-term is positive (healthy stock, temporary dip)
+                if ret_21d and ret_21d > 0:
+                    score *= 1.2
+                
+                candidates.append(ScreenedCandidate(
+                    symbol=symbol,
+                    score=score,
+                    signals={
+                        "return_1d": ret_1d,
+                        "return_5d": ret_5d,
+                        "return_21d": ret_21d or 0,
+                        "volatility_21d": vol_21d or 0,
+                        "price": price,
+                    },
+                    thesis_fit=thesis_fit,
+                    reasoning=(
+                        f"Oversold bounce: 1d={ret_1d:+.1%}, 5d={ret_5d:+.1%}"
+                    ),
+                ))
+    
+    elif "volatility" in strategy_lower:
+        # Volatility: look for vol spikes or regime changes
+        thesis_fit = "volatility"
+        for symbol in symbols:
+            vol_5d = snapshot.get_volatility(symbol, "5d")
+            vol_21d = snapshot.get_volatility(symbol, "21d")
+            ret_5d = snapshot.get_return(symbol, "5d")
+            price = snapshot.get_price(symbol)
+            
+            if vol_5d is None or vol_21d is None or price is None:
+                continue
+            
+            # Skip if already held
+            if symbol in portfolio.positions:
+                continue
+            
+            # Vol spike score: short-term vol much higher than longer-term
+            vol_ratio = vol_5d / vol_21d if vol_21d > 0 else 1.0
+            score = vol_ratio - 1.0  # How much vol has spiked
+            
+            if vol_ratio > 1.3:  # Significant vol spike
+                candidates.append(ScreenedCandidate(
+                    symbol=symbol,
+                    score=score,
+                    signals={
+                        "volatility_5d": vol_5d,
+                        "volatility_21d": vol_21d,
+                        "return_5d": ret_5d or 0,
+                        "price": price,
+                    },
+                    thesis_fit=thesis_fit,
+                    reasoning=(
+                        f"Vol spike: 5d={vol_5d:.1%} vs 21d={vol_21d:.1%} "
+                        f"(ratio={vol_ratio:.1f}x)"
+                    ),
+                ))
+    
+    else:
+        # Unknown strategy - return empty
+        signals_log(
+            f"Unknown strategy '{strategy}' - no screening available",
+            level=logging.WARNING
+        )
+        return []
+    
+    # Sort by score (highest first) and return top_k
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    
+    signals_log(
+        f"Screened {len(symbols)} stocks, found {len(candidates)} candidates "
+        f"for {thesis_fit}"
+    )
+    if candidates:
+        top_3 = candidates[:3]
+        signals_log(
+            f"Top 3: {', '.join(f'{c.symbol}({c.score:.2f})' for c in top_3)}"
+        )
+    
+    return candidates[:top_k]
+
+
 class CollaborativeDebateRunner:
     """
-    Investment committee debate system V2.1.
+    Investment committee debate system V2.2 - DATA-FIRST.
     
-    Key features:
-    - Round-based structure (both agents respond per round)
-    - Deterministic consensus gates (not LLM vibes)
-    - Machine-validated evidence citations
-    - Risk manager owns final sizing
-    - Experience replay for learning
+    Key changes from V2.1:
+    - SCREEN FIRST: Scan entire universe, rank by actual signals
+    - PRESENT CANDIDATES: Both agents see the SAME top candidates
+    - DEBATE ON DATA: Agents discuss specific stocks with real numbers
+    - NO GUESSING: Agents pick from pre-screened list only
     
     Debate flow:
-    1. Pre-debate: accountability brief + experience retrieval
-    2. Committee rounds: both agents propose, validate, check gate
-    3. Post-debate: risk manager sizing, record experience
+    1. Screen: Rank all stocks by strategy-specific signals
+    2. Present: Show top 5 candidates to both agents with full data
+    3. Debate: Agents discuss and converge on ONE candidate
+    4. Execute: Trade the agreed stock with validated signals
     """
     
     MAX_ROUNDS = 3
@@ -729,19 +915,57 @@ class CollaborativeDebateRunner:
         transcript: List[DebateMessage] = []
         conversation: List[AgentTurn] = []
         
+        debate_log(f"Fund {fund_id} starting debate for {simulation_date}")
+        debate_log(
+            f"Portfolio: ${portfolio.total_value:,.0f}, "
+            f"Cash: ${portfolio.cash:,.0f} ({portfolio.cash/portfolio.total_value:.0%}), "
+            f"Positions: {len(portfolio.positions)}"
+        )
+        
         try:
             # 0. Check data availability - V2 requires return data
             if not self._has_sufficient_data(snapshot):
-                logger.info(
-                    f"[{fund_id}] Insufficient data for V2 debate on "
-                    f"{simulation_date}, defaulting to HOLD"
+                debate_log(
+                    f"Insufficient data for V2 debate on {simulation_date}, "
+                    f"defaulting to HOLD",
+                    level=logging.WARNING
                 )
                 return self._create_hold_decision(
                     "Insufficient historical data for analysis (early simulation period)",
                     transcript
                 )
             
-            # 1. Pre-debate setup
+            # =========================================================
+            # PHASE 1: DATA-FIRST SCREENING
+            # Scan entire universe, rank by strategy-specific signals
+            # =========================================================
+            debate_log(f"Phase 1: Screening universe for {fund_thesis[:50]}...")
+            
+            candidates = screen_universe_for_strategy(
+                snapshot=snapshot,
+                strategy=fund_thesis,
+                portfolio=portfolio,
+                top_k=5,
+            )
+            
+            if not candidates:
+                debate_log(
+                    "No candidates found for strategy, defaulting to HOLD",
+                    level=logging.WARNING
+                )
+                return self._create_hold_decision(
+                    f"No stocks in universe match {fund_thesis[:30]} criteria today",
+                    transcript
+                )
+            
+            # Log the candidates we're presenting
+            debate_log(f"Found {len(candidates)} candidates:")
+            for i, c in enumerate(candidates, 1):
+                debate_log(f"  #{i} {c.symbol}: {c.reasoning} (score={c.score:.3f})")
+            
+            # =========================================================
+            # PHASE 2: PRE-DEBATE SETUP
+            # =========================================================
             accountability_brief = generate_accountability_brief(
                 fund_id, simulation_date, self.experience_store
             )
@@ -750,17 +974,26 @@ class CollaborativeDebateRunner:
                 snapshot, fund_id=fund_id, k=3
             )
             
-            # 2. Build context
-            context = self._build_enhanced_context(
+            # Build context WITH screened candidates
+            context = self._build_enhanced_context_with_candidates(
                 fund_name, fund_thesis, portfolio, snapshot,
-                simulation_date, accountability_brief, similar_episodes
+                simulation_date, accountability_brief, similar_episodes,
+                candidates,  # NEW: pass candidates
             )
             
-            # 3. Run committee rounds
+            # Store candidates for validation later
+            valid_symbols = {c.symbol for c in candidates}
+            candidate_signals = {c.symbol: c.signals for c in candidates}
+            
+            # =========================================================
+            # PHASE 3: COMMITTEE DEBATE
+            # Agents discuss THE SAME candidates, must pick from list
+            # =========================================================
+            debate_log(f"Phase 2: Committee debate on {len(candidates)} candidates...")
             consensus_board = ConsensusBoard()
             
             for round_num in range(self.MAX_ROUNDS):
-                logger.info(f"[{fund_id}] Round {round_num + 1}/{self.MAX_ROUNDS}")
+                debate_log(f"Round {round_num + 1}/{self.MAX_ROUNDS} - Analyst proposing...")
                 
                 # Get analyst turn
                 analyst_turn, analyst_errors = await self._get_agent_turn_with_repair(
@@ -775,6 +1008,17 @@ class CollaborativeDebateRunner:
                     transcript=transcript,
                 )
                 
+                if analyst_turn:
+                    debate_log(
+                        f"Analyst: {analyst_turn.action.upper()} "
+                        f"{analyst_turn.symbol or 'N/A'} @ "
+                        f"{analyst_turn.suggested_weight:.0%} weight, "
+                        f"thesis={analyst_turn.thesis.thesis_type.value}, "
+                        f"confidence={analyst_turn.confidence.overall():.0%}"
+                    )
+                
+                debate_log(f"Round {round_num + 1}/{self.MAX_ROUNDS} - Critic responding...")
+                
                 # Get critic turn
                 critic_turn, critic_errors = await self._get_agent_turn_with_repair(
                     agent_id="critic",
@@ -788,10 +1032,21 @@ class CollaborativeDebateRunner:
                     transcript=transcript,
                 )
                 
+                if critic_turn:
+                    debate_log(
+                        f"Critic: {critic_turn.action.upper()} "
+                        f"{critic_turn.symbol or 'N/A'} @ "
+                        f"{critic_turn.suggested_weight:.0%} weight, "
+                        f"thesis={critic_turn.thesis.thesis_type.value}, "
+                        f"confidence={critic_turn.confidence.overall():.0%}"
+                    )
+                
                 # If either failed, default to HOLD
                 if analyst_turn is None or critic_turn is None:
-                    logger.warning(
-                        f"[{fund_id}] Agent failed validation, defaulting to HOLD"
+                    debate_log(
+                        f"Agent failed validation, defaulting to HOLD. "
+                        f"Errors: {analyst_errors + critic_errors}",
+                        level=logging.WARNING
                     )
                     return self._create_hold_decision(
                         f"Validation failed: {analyst_errors + critic_errors}",
@@ -800,28 +1055,70 @@ class CollaborativeDebateRunner:
                 
                 conversation.extend([analyst_turn, critic_turn])
                 
-                # Update consensus board with fund strategy for thesis validation
+                # Update consensus board with fund strategy and valid symbols
                 consensus_board = update_consensus_board(
                     consensus_board, analyst_turn, critic_turn, snapshot,
-                    fund_strategy=fund_thesis
+                    fund_strategy=fund_thesis,
+                    valid_symbols=valid_symbols,  # V2.2: pass screened candidates
+                )
+                
+                # Log gate status
+                gate = consensus_board.gate
+                consensus_log(f"Computing gate for {fund_id}...")
+                consensus_log(
+                    f"action_match={gate.action_match}, "
+                    f"symbol_match={gate.symbol_match}, "
+                    f"symbol_in_candidates={gate.symbol_in_candidates}, "
+                    f"thesis_type_match={gate.thesis_type_match}"
+                )
+                consensus_log(
+                    f"fund_strategy_match={gate.fund_strategy_match} "
+                    f"({fund_thesis.split()[0]} -> {analyst_turn.thesis.thesis_type.value})"
+                )
+                consensus_log(
+                    f"min_confidence_met={gate.min_confidence_met} "
+                    f"({min(analyst_turn.confidence.min_component(), critic_turn.confidence.min_component()):.2f} >= 0.5)"
+                )
+                consensus_log(
+                    f"min_edge_met={gate.min_edge_met} "
+                    f"({min(analyst_turn.confidence.signal_strength, critic_turn.confidence.signal_strength):.2f} >= 0.6)"
                 )
                 
                 # Check if consensus reached
                 if consensus_board.can_execute():
-                    logger.info(f"[{fund_id}] Consensus reached in round {round_num + 1}")
+                    consensus_log(
+                        f"Gate PASSED - all {len(gate.passed_gates())} checks OK",
+                        level=logging.INFO
+                    )
                     break
+                else:
+                    consensus_log(
+                        f"Gate FAILED - {len(gate.failed_gates())} checks failed: "
+                        f"{gate.failed_gates()}",
+                        level=logging.WARNING
+                    )
             
             # 4. Finalize decision
             if consensus_board.can_execute():
                 decision = self._build_consensus_decision(
                     consensus_board, analyst_turn, critic_turn,
-                    portfolio, transcript, snapshot, fund_id
+                    portfolio, transcript, snapshot, fund_id,
+                    valid_symbols, candidate_signals,  # Pass screened candidates
+                )
+                debate_log(
+                    f"Final decision: {decision.action.upper()} "
+                    f"{decision.symbol or 'N/A'} @ {decision.target_weight or 0:.0%}, "
+                    f"confidence={decision.confidence:.0%}"
                 )
             else:
-                logger.info(
-                    f"[{fund_id}] No consensus after {self.MAX_ROUNDS} rounds, "
-                    f"failed gates: {consensus_board.gate.failed_gates()}"
+                consensus_log(
+                    f"No consensus after {self.MAX_ROUNDS} rounds",
+                    level=logging.WARNING
                 )
+                if consensus_board.gate.rejection_reasons:
+                    consensus_log("Rejection reasons:")
+                    for reason in consensus_board.gate.rejection_reasons:
+                        consensus_log(f"  - {reason}")
                 decision = self._create_hold_decision(
                     f"No consensus: {consensus_board.gate.failed_gates()}",
                     transcript
@@ -1043,6 +1340,98 @@ SIMILAR PAST EPISODES:
 
 AVAILABLE THESIS TYPES: {', '.join(t.value for t in ThesisType)}"""
     
+    def _build_enhanced_context_with_candidates(
+        self,
+        fund_name: str,
+        fund_thesis: str,
+        portfolio: BacktestPortfolio,
+        snapshot: GlobalMarketSnapshot,
+        simulation_date: date,
+        accountability_brief: str,
+        similar_episodes: Dict[str, List],
+        candidates: List[ScreenedCandidate],
+    ) -> str:
+        """
+        Build context with PRE-SCREENED candidates.
+        
+        This is the key change: agents see ONLY the candidates that passed
+        data-driven screening. They must pick from this list.
+        """
+        # Portfolio summary
+        positions_str = ""
+        for sym, pos in portfolio.positions.items():
+            weight = portfolio.get_position_weight(sym)
+            positions_str += (
+                f"  - {sym}: {pos.quantity:.0f} shares @ "
+                f"${pos.current_price:.2f} "
+                f"({weight:.1%}, {pos.unrealized_return:+.1%})\n"
+            )
+        
+        if not positions_str:
+            positions_str = "  (No positions - 100% cash)\n"
+        
+        # Build candidate details - this is what agents will debate
+        candidates_str = ""
+        for i, c in enumerate(candidates, 1):
+            signals_str = ", ".join(
+                f"{k}={v:+.1%}" if "return" in k or "volatility" in k else f"{k}=${v:.2f}"
+                for k, v in c.signals.items()
+                if v is not None
+            )
+            candidates_str += (
+                f"  #{i} {c.symbol} (score={c.score:.2f})\n"
+                f"      Signals: {signals_str}\n"
+                f"      Fit: {c.thesis_fit} - {c.reasoning}\n"
+            )
+        
+        # Similar episodes summary
+        episodes_str = ""
+        for ep in similar_episodes.get("similar", [])[:2]:
+            episodes_str += (
+                f"  - {ep.record_date}: {ep.action} {ep.symbol or ''} "
+                f"({ep.thesis_type}) -> {ep.outcome_5d or 0:+.1%}\n"
+            )
+        
+        if not episodes_str:
+            episodes_str = "  (No similar episodes found)\n"
+        
+        # Get the thesis type from candidates
+        thesis_type = candidates[0].thesis_fit if candidates else "unknown"
+        valid_symbols = [c.symbol for c in candidates]
+        
+        return f"""DATE: {simulation_date}
+FUND: {fund_name}
+THESIS: {fund_thesis}
+
+{accountability_brief}
+
+PORTFOLIO:
+  Total Value: ${portfolio.total_value:,.2f}
+  Cash: ${portfolio.cash:,.2f} ({portfolio.cash/portfolio.total_value:.1%})
+{positions_str}
+
+============================================================
+PRE-SCREENED CANDIDATES (ranked by {thesis_type} signals)
+============================================================
+These stocks passed quantitative screening. You MUST pick from this list.
+Do NOT suggest stocks outside this list - they failed screening.
+
+{candidates_str}
+VALID SYMBOLS: {', '.join(valid_symbols)}
+
+============================================================
+
+SIMILAR PAST EPISODES:
+{episodes_str}
+
+RULES:
+1. You MUST select a symbol from the VALID SYMBOLS list above
+2. If you disagree with all candidates, recommend HOLD
+3. Cite the actual signal values shown above in your evidence
+4. Thesis type must be: {thesis_type}
+
+AVAILABLE THESIS TYPES: {', '.join(t.value for t in ThesisType)}"""
+    
     def _get_agent_system_prompt(self, role: str, fund_thesis: str) -> str:
         """Get system prompt for agent role."""
         base = f"""You are the {role.upper()} in an investment committee for a fund.
@@ -1086,36 +1475,40 @@ You must respond with ONLY valid JSON in this exact format:
 }}
 
 CRITICAL RULES:
-1. ONLY cite features listed in "FEATURES AVAILABLE TODAY" in the context
-   - If return_21d is not listed, DO NOT cite it
-   - If only return_1d and return_5d are available, use mean_reversion thesis
-2. You must cite at least 2 evidence items that EXIST in the data
-3. Match thesis_type to available features:
-   - momentum: needs return_21d or return_63d (if available)
+1. SYMBOL SELECTION: You MUST pick from the "VALID SYMBOLS" list in the context
+   - These stocks passed quantitative screening for this strategy
+   - Do NOT suggest any symbol outside that list - they failed screening
+   - If you disagree with ALL candidates, recommend HOLD with symbol=null
+2. Use the ACTUAL signal values shown in the PRE-SCREENED CANDIDATES section
+   - Copy the exact numbers (return_1d, return_5d, etc.) from the candidate data
+   - Do not make up signal values
+3. Match thesis_type to the fund's strategy:
+   - momentum: needs return_21d or return_63d
    - mean_reversion: needs return_1d or return_5d
    - volatility: needs volatility_5d or volatility_21d
-4. If required features aren't available, propose HOLD action
-5. All confidence components should be 0.0-1.0
-6. HORIZON ALIGNMENT: Use standard horizons:
+4. All confidence components should be 0.0-1.0
+5. HORIZON ALIGNMENT: Use standard horizons:
    - Short-term: 5 days (for mean_reversion)
    - Medium-term: 21 days (for momentum)
-7. If colleague proposed a horizon, try to match it"""
+6. If colleague proposed a symbol, DISCUSS THAT SAME SYMBOL
+   - Agree or disagree, but focus the debate on the same stock
+   - Don't randomly switch to a different symbol"""
         
         if role == "analyst":
             return base + """
 
 As ANALYST, focus on:
-- Identifying opportunities based on the fund's thesis
-- Citing specific evidence from market data
-- Proposing actionable trades with clear reasoning"""
+- Pick the BEST candidate from the pre-screened list
+- Cite the specific signal values shown for that candidate
+- Explain why this candidate fits the fund's thesis"""
         else:
             return base + """
 
 As CRITIC, focus on:
-- Challenging assumptions in the analyst's proposal
-- Identifying risks and failure modes
-- Ensuring evidence supports the thesis
-- Being conservative when uncertain"""
+- RESPOND TO THE ANALYST'S PICK - discuss the SAME symbol
+- Challenge: Is this really the best candidate from the list?
+- If you agree, confirm. If you disagree, explain why another candidate is better
+- Do NOT pick a random different symbol - stay focused on the debate"""
     
     def _build_agent_prompt(
         self,
@@ -1261,28 +1654,82 @@ Please fix and respond again with valid JSON."""
         transcript: List[DebateMessage],
         snapshot: GlobalMarketSnapshot,
         fund_id: str,
+        valid_symbols: Set[str],
+        candidate_signals: Dict[str, Dict[str, float]],
     ) -> TradingDecision:
         """
         Build final decision from consensus.
         
         Includes signal extraction and validation blocking.
+        Now also validates symbol is from screened candidates.
         """
         action = consensus_board.agreed_action or "hold"
+        symbol = consensus_board.agreed_symbol
+        
+        # GUARDRAIL 0: Symbol must be from screened candidates
+        if action != "hold" and symbol:
+            if symbol not in valid_symbols:
+                debate_log(
+                    f"BLOCKING trade - {symbol} not in screened candidates: "
+                    f"{valid_symbols}",
+                    level=logging.WARNING
+                )
+                return self._create_hold_decision(
+                    f"Trade blocked: {symbol} not in pre-screened candidates",
+                    transcript
+                )
+            
+            # Use pre-computed signals from screening (more reliable)
+            if symbol in candidate_signals:
+                signals_log(
+                    f"Using pre-screened signals for {symbol}: "
+                    f"{candidate_signals[symbol]}"
+                )
         
         # Extract signals from evidence with thesis-specific validation
         thesis_type = (
             consensus_board.agreed_thesis_type or 
             analyst_turn.thesis.thesis_type
         )
-        audit = self._extract_signals_from_evidence(
-            analyst_turn, critic_turn, snapshot, thesis_type
-        )
+        
+        # Prefer candidate signals over LLM-cited evidence
+        if symbol and symbol in candidate_signals:
+            # Build audit from screened signals (more reliable)
+            screened_signals = candidate_signals[symbol]
+            audit = DecisionAuditTrail(
+                signals_used={
+                    f"{symbol}_{k}": v 
+                    for k, v in screened_signals.items() 
+                    if v is not None
+                },
+                evidence_used=[
+                    {"symbol": symbol, "feature": k, "value": v, "source": "screening"}
+                    for k, v in screened_signals.items()
+                    if v is not None
+                ],
+                validation_report={
+                    "passed": True,
+                    "errors": [],
+                    "missing_required": [],
+                    "source": "pre_screened_candidates",
+                },
+            )
+            signals_log(
+                f"Using {len(audit.signals_used)} pre-screened signals for {symbol}"
+            )
+        else:
+            audit = self._extract_signals_from_evidence(
+                analyst_turn, critic_turn, snapshot, thesis_type
+            )
         
         # GUARDRAIL: Block trades without validated signals
         if action != "hold":
             # Block 1: No signals at all
             if not audit.signals_used:
-                logger.warning(f"[{fund_id}] Blocking trade - no validated signals")
+                debate_log(
+                    "BLOCKING trade - no validated signals attached",
+                    level=logging.WARNING
+                )
                 return self._create_hold_decision(
                     "Trade blocked: no validated signals attached",
                     transcript
@@ -1290,9 +1737,10 @@ Please fix and respond again with valid JSON."""
             
             # Block 2: Required features for thesis missing
             if not audit.validation_report["passed"]:
-                logger.warning(
-                    f"[{fund_id}] Blocking trade - validation failed: "
-                    f"{audit.validation_report['errors']}"
+                debate_log(
+                    f"BLOCKING trade - validation failed: "
+                    f"{audit.validation_report['errors']}",
+                    level=logging.WARNING
                 )
                 return self._create_hold_decision(
                     f"Trade blocked: {audit.validation_report['errors']}",
@@ -1372,6 +1820,10 @@ Please fix and respond again with valid JSON."""
         evidence: List[Dict[str, Any]] = []
         errors: List[str] = []
         
+        # Get symbol being traded
+        symbol = analyst_turn.symbol or critic_turn.symbol or "?"
+        signals_log(f"Extracting signals for {symbol}...")
+        
         for agent_id, turn in [("analyst", analyst_turn), ("critic", critic_turn)]:
             for ref in turn.evidence_cited:
                 key = f"{ref.symbol}_{ref.feature}"
@@ -1389,6 +1841,13 @@ Please fix and respond again with valid JSON."""
                 elif key not in signals:
                     signals[key] = value
         
+        # Log found signals
+        if signals:
+            signal_strs = [f"{k}={v:.4f}" for k, v in list(signals.items())[:5]]
+            signals_log(f"Found: {', '.join(signal_strs)}")
+        else:
+            signals_log("No signals found!", level=logging.WARNING)
+        
         # Thesis-specific validation: check required features are present
         required = THESIS_REQUIRED_EVIDENCE.get(thesis_type, set())
         cited_features = {
@@ -1396,6 +1855,8 @@ Please fix and respond again with valid JSON."""
             analyst_turn.evidence_cited + critic_turn.evidence_cited
         }
         missing_required = required - cited_features
+        
+        signals_log(f"Thesis {thesis_type.value} requires: {required}")
         
         if missing_required:
             errors.append(
@@ -1405,6 +1866,18 @@ Please fix and respond again with valid JSON."""
         
         # Validation passes if no errors AND we have enough signals
         passed = len(errors) == 0 and len(signals) >= len(required)
+        
+        if passed:
+            signals_log(
+                f"Validation PASSED - {len(signals)} signals, "
+                f"{len(missing_required)} missing"
+            )
+        else:
+            signals_log(
+                f"Validation FAILED - {len(signals)} signals, "
+                f"errors: {errors}",
+                level=logging.WARNING
+            )
         
         return DecisionAuditTrail(
             signals_used=signals,
