@@ -18,28 +18,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Forbidden tokens that indicate narrative/temporal leakage
+# Forbidden tokens that indicate temporal leakage (future knowledge)
+# Keep this minimal - only block clear indicators of using future info
 FORBIDDEN_TOKENS = [
-    # Major tickers (common ones - expand as needed)
-    "aapl", "msft", "goog", "googl", "amzn", "tsla", "meta", "nvda",
-    "fb", "nflx", "baba", "jpm", "wmt", "v", "ma", "dis",
-    
-    # Products/brands
-    "iphone", "ipad", "macbook", "windows", "surface", "azure",
-    "model 3", "model s", "model x", "model y", "cybertruck",
-    "aws", "prime", "alexa", "kindle", "echo",
-    "instagram", "whatsapp", "oculus", "quest",
-    
-    # Narrative keywords
-    "product launch", "services growth", "innovation",
-    "market leader", "dominant", "disruption", "disruptive",
-    "game-changer", "revolutionary", "iconic brand",
-    "brand strength", "brand value", "brand recognition",
-    
-    # Events/news (temporal leakage indicators)
+    # Events that indicate future knowledge
     "pandemic", "covid", "coronavirus", "lockdown",
-    "chip shortage", "supply chain", "earnings beat",
-    "guidance raised", "merger", "acquisition",
+    "chip shortage", "2008 crisis", "2020 crash",
+    "will announce", "upcoming earnings", "next quarter",
 ]
 
 

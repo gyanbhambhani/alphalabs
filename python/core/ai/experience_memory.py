@@ -1,348 +1,635 @@
 """
-Experience Memory - Retrieval-based learning
+Experience Memory Store for Collaborative Debate System V2.1
 
-Stores and retrieves past trades for contextual learning.
+Stores and retrieves past trading decisions for:
+- Similar episode retrieval (with regime gates)
+- Outcome tracking (for accountability briefs)
+- Learning from history (without RL complexity)
 
-Before each decision, the system can query:
-- "Show me similar past trades"
-- "What happened when we were in this state before?"
-- "What's the win rate for this signal?"
-
-This enables:
-1. Experience replay (RL-style)
-2. Contextual bandit learning
-3. LLM can see past outcomes as context
+Key features:
+- Time decay on old records
+- Regime similarity filtering
+- Anti-example retrieval (similar state, opposite outcome)
 """
 
-from typing import List, Optional, Dict, Tuple
-from datetime import date
-import numpy as np
+import json
 import logging
-from dataclasses import dataclass
+import sqlite3
+import uuid
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
-
-from db.models import ExperienceRecord
-from core.backtest.persistence import BacktestPersistence
+from core.collaboration.debate_v2 import (
+    AgentTurn,
+    ExperienceRecord,
+    ThesisType,
+    retrieve_with_diversity,
+)
+from core.data.snapshot import GlobalMarketSnapshot
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SimilarTrade:
-    """A similar past trade retrieved from memory."""
-    decision_id: str
-    symbol: str
-    action: str
-    weight: float
-    regime: str
-    outcome_21d: float
-    outcome_5d: Optional[float]
-    alpha_vs_spy: Optional[float]
-    win: bool
-    similarity_score: float  # Cosine similarity
-    decision_date: date
-
-
-@dataclass
-class AggregateStats:
-    """Aggregate statistics from similar trades."""
-    count: int
-    win_rate: float
-    median_return_21d: float
-    mean_return_21d: float
-    median_alpha: float
-    volatility: float
-
-
-class ExperienceMemory:
+class ExperienceStore:
     """
-    Stores and retrieves past trades for contextual learning.
+    SQLite-backed experience store for debate learning.
     
-    Uses cosine similarity on normalized feature vectors.
+    Stores decisions with state features and outcomes for similarity
+    retrieval and accountability briefs.
     """
     
-    def __init__(self, persistence: BacktestPersistence):
+    def __init__(self, db_path: str = "data/experience.db"):
         """
-        Initialize experience memory.
+        Initialize experience store.
         
         Args:
-            persistence: Persistence layer for DB access
+            db_path: Path to SQLite database
         """
-        self.persistence = persistence
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
     
-    def store_experience(
+    def _init_db(self) -> None:
+        """Initialize database schema."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS experience_records (
+                    record_id TEXT PRIMARY KEY,
+                    record_date TEXT NOT NULL,
+                    fund_id TEXT NOT NULL,
+                    state_features TEXT NOT NULL,
+                    regime_tags TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    symbol TEXT,
+                    thesis_type TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    rationale_summary TEXT,
+                    counterfactual TEXT,
+                    outcome_1d REAL,
+                    outcome_5d REAL,
+                    outcome_21d REAL,
+                    max_drawdown REAL,
+                    invalidation_triggered INTEGER,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_experience_fund_date 
+                ON experience_records(fund_id, record_date)
+            """)
+            
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_experience_date 
+                ON experience_records(record_date)
+            """)
+            
+            conn.commit()
+    
+    def record(
         self,
-        decision_id: str,
-        run_id: str,
+        snapshot: GlobalMarketSnapshot,
         fund_id: str,
-        feature_vector: List[float],
         action: str,
-        symbol: Optional[str] = None,
-        weight: Optional[float] = None,
-        regime: Optional[str] = None,
-        decision_date: Optional[date] = None,
+        symbol: Optional[str],
+        thesis_type: ThesisType,
+        confidence: float,
+        conversation: List[AgentTurn],
     ) -> str:
         """
-        Store a trade in experience memory.
+        Record a decision for future retrieval.
         
         Args:
-            decision_id: Decision ID
-            run_id: Run ID
-            fund_id: Fund ID
-            feature_vector: Normalized feature vector
-            action: "buy", "sell", "hold"
-            symbol: Asset symbol
-            weight: Position weight
-            regime: Market regime
-            decision_date: Date of decision
+            snapshot: Market snapshot at decision time
+            fund_id: Fund making the decision
+            action: Action taken (buy/sell/hold)
+            symbol: Symbol traded (if any)
+            thesis_type: Type of thesis
+            confidence: Overall confidence
+            conversation: Full conversation history
             
         Returns:
-            Experience record ID
+            Record ID
         """
-        return self.persistence.save_experience_record(
-            decision_id=decision_id,
-            run_id=run_id,
-            fund_id=fund_id,
-            feature_vector=feature_vector,
-            action=action,
-            symbol=symbol,
-            weight=weight,
-            regime=regime,
-            decision_date=decision_date,
-        )
+        record_id = str(uuid.uuid4())[:12]
+        features = self._extract_feature_vector(snapshot)
+        regime = self._detect_regime(snapshot)
+        
+        # Summarize conversation
+        rationale = self._summarize_conversation(conversation)
+        counterfactual = self._extract_counterfactuals(conversation)
+        
+        record_date = snapshot.asof_timestamp.date().isoformat()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO experience_records (
+                    record_id, record_date, fund_id, state_features, regime_tags,
+                    action, symbol, thesis_type, confidence, rationale_summary,
+                    counterfactual, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record_id,
+                record_date,
+                fund_id,
+                json.dumps(features),
+                json.dumps(regime),
+                action,
+                symbol,
+                thesis_type.value,
+                confidence,
+                rationale,
+                counterfactual,
+                datetime.utcnow().isoformat(),
+            ))
+            conn.commit()
+        
+        logger.info(f"Recorded experience {record_id} for {fund_id}")
+        return record_id
     
     def retrieve_similar(
         self,
-        feature_vector: List[float],
-        k: int = 5,
+        snapshot: GlobalMarketSnapshot,
         fund_id: Optional[str] = None,
-        action_filter: Optional[str] = None,
-        regime_filter: Optional[str] = None,
-        min_outcome_data: bool = True,
-    ) -> List[SimilarTrade]:
+        k: int = 3,
+        max_age_days: int = 252,
+    ) -> Dict[str, List[ExperienceRecord]]:
         """
-        Retrieve k most similar past trades.
-        
-        Uses cosine similarity on feature vectors.
+        Retrieve similar past episodes with diversity.
         
         Args:
-            feature_vector: Current state's feature vector
-            k: Number of similar trades to retrieve
-            fund_id: Filter by fund (optional)
-            action_filter: Filter by action (optional)
-            regime_filter: Filter by regime (optional)
-            min_outcome_data: Only return trades with outcomes filled in
+            snapshot: Current market snapshot
+            fund_id: Optional fund filter
+            k: Number of similar records
+            max_age_days: Maximum age of records
             
         Returns:
-            List of similar trades, sorted by similarity
+            Dict with similar, positive_precedent, negative_precedent
         """
-        # Normalize query vector
-        query_norm = self._normalize_vector(feature_vector)
+        current_features = self._extract_feature_vector(snapshot)
+        current_regime = self._detect_regime(snapshot)
+        current_date = snapshot.asof_timestamp.date()
         
-        # Fetch experiences from DB
-        with self.persistence.get_session() as session:
-            query = select(ExperienceRecord)
-            
-            # Apply filters
-            if fund_id:
-                query = query.where(ExperienceRecord.fund_id == fund_id)
-            if action_filter:
-                query = query.where(ExperienceRecord.action == action_filter)
-            if regime_filter:
-                query = query.where(ExperienceRecord.regime == regime_filter)
-            if min_outcome_data:
-                query = query.where(ExperienceRecord.outcome_21d.isnot(None))
-            
-            experiences = session.execute(query).scalars().all()
+        # Load all records
+        all_records = self._load_all(fund_id=fund_id, with_outcomes=True)
         
-        if not experiences:
-            logger.debug("No experiences found matching filters")
-            return []
-        
-        # Compute similarities
-        similarities = []
-        for exp in experiences:
-            stored_vector = exp.feature_vector
-            if not stored_vector:
-                continue
-            
-            # Compute cosine similarity
-            similarity = self._cosine_similarity(query_norm, stored_vector)
-            
-            similarities.append((similarity, exp))
-        
-        # Sort by similarity (descending)
-        similarities.sort(key=lambda x: x[0], reverse=True)
-        
-        # Return top k
-        results = []
-        for sim_score, exp in similarities[:k]:
-            results.append(SimilarTrade(
-                decision_id=exp.decision_id,
-                symbol=exp.symbol or "N/A",
-                action=exp.action,
-                weight=exp.weight or 0.0,
-                regime=exp.regime or "unknown",
-                outcome_21d=exp.outcome_21d or 0.0,
-                outcome_5d=exp.outcome_5d,
-                alpha_vs_spy=exp.alpha_vs_spy,
-                win=exp.win or False,
-                similarity_score=sim_score,
-                decision_date=exp.decision_date,
-            ))
-        
-        return results
-    
-    def get_aggregate_stats(
-        self,
-        similar_trades: List[SimilarTrade],
-    ) -> Optional[AggregateStats]:
-        """
-        Compute aggregate statistics from similar trades.
-        
-        Args:
-            similar_trades: List of similar trades
-            
-        Returns:
-            Aggregate statistics
-        """
-        if not similar_trades:
-            return None
-        
-        # Extract outcomes
-        returns_21d = [t.outcome_21d for t in similar_trades if t.outcome_21d is not None]
-        alphas = [t.alpha_vs_spy for t in similar_trades if t.alpha_vs_spy is not None]
-        wins = [t.win for t in similar_trades]
-        
-        if not returns_21d:
-            return None
-        
-        return AggregateStats(
-            count=len(similar_trades),
-            win_rate=sum(wins) / len(wins) if wins else 0.0,
-            median_return_21d=float(np.median(returns_21d)),
-            mean_return_21d=float(np.mean(returns_21d)),
-            median_alpha=float(np.median(alphas)) if alphas else 0.0,
-            volatility=float(np.std(returns_21d)),
+        # Use the retrieval function from debate_v2
+        return retrieve_with_diversity(
+            current_features=current_features,
+            current_regime=current_regime,
+            current_date=current_date,
+            all_records=all_records,
+            k=k,
+            max_age_days=max_age_days,
         )
     
-    def format_for_llm_context(
+    def update_outcomes(
         self,
-        similar_trades: List[SimilarTrade],
-        aggregate_stats: Optional[AggregateStats] = None,
-    ) -> str:
+        record_id: str,
+        outcome_1d: Optional[float] = None,
+        outcome_5d: Optional[float] = None,
+        outcome_21d: Optional[float] = None,
+        max_drawdown: Optional[float] = None,
+        invalidation_triggered: Optional[bool] = None,
+    ) -> None:
         """
-        Format similar trades as LLM context string.
+        Update outcomes after holding period.
+        
+        Called by simulation engine after N days.
         
         Args:
-            similar_trades: Retrieved similar trades
-            aggregate_stats: Aggregate statistics
+            record_id: Record to update
+            outcome_1d: 1-day return
+            outcome_5d: 5-day return
+            outcome_21d: 21-day return
+            max_drawdown: Maximum drawdown during period
+            invalidation_triggered: Whether invalidation rules triggered
+        """
+        updates = []
+        params = []
+        
+        if outcome_1d is not None:
+            updates.append("outcome_1d = ?")
+            params.append(outcome_1d)
+        if outcome_5d is not None:
+            updates.append("outcome_5d = ?")
+            params.append(outcome_5d)
+        if outcome_21d is not None:
+            updates.append("outcome_21d = ?")
+            params.append(outcome_21d)
+        if max_drawdown is not None:
+            updates.append("max_drawdown = ?")
+            params.append(max_drawdown)
+        if invalidation_triggered is not None:
+            updates.append("invalidation_triggered = ?")
+            params.append(1 if invalidation_triggered else 0)
+        
+        if not updates:
+            return
+        
+        params.append(record_id)
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                f"UPDATE experience_records SET {', '.join(updates)} "
+                f"WHERE record_id = ?",
+                params
+            )
+            conn.commit()
+        
+        logger.debug(f"Updated outcomes for {record_id}")
+    
+    def get_latest_decision(
+        self,
+        fund_id: str,
+        before_date: date,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent decision for a fund before a date.
+        
+        Used for accountability briefs.
+        
+        Args:
+            fund_id: Fund ID
+            before_date: Get decisions before this date
             
         Returns:
-            Formatted string for LLM prompt
+            Decision dict or None
         """
-        if not similar_trades:
-            return "EXPERIENCE MEMORY: No similar past trades found.\n"
-        
-        context = "EXPERIENCE MEMORY (similar past trades):\n\n"
-        
-        for i, trade in enumerate(similar_trades, 1):
-            context += (
-                f"{i}. {trade.symbol} - {trade.action.upper()} "
-                f"{trade.weight:.1%} (similarity: {trade.similarity_score:.2f})\n"
-                f"   Regime: {trade.regime}\n"
-                f"   Outcome 21d: {trade.outcome_21d:+.1%}"
-            )
-            if trade.alpha_vs_spy is not None:
-                context += f" (alpha: {trade.alpha_vs_spy:+.1%})"
-            context += f" - {'WIN' if trade.win else 'LOSS'}\n"
-        
-        if aggregate_stats:
-            context += f"\nAGGREGATE STATS ({aggregate_stats.count} similar trades):\n"
-            context += f"- Win rate: {aggregate_stats.win_rate:.0%}\n"
-            context += f"- Median 21d return: {aggregate_stats.median_return_21d:+.1%}\n"
-            context += f"- Median alpha: {aggregate_stats.median_alpha:+.1%}\n"
-            context += f"- Volatility: {aggregate_stats.volatility:.1%}\n"
-        
-        context += "\n"
-        return context
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT * FROM experience_records
+                WHERE fund_id = ? AND record_date < ?
+                ORDER BY record_date DESC
+                LIMIT 1
+            """, (fund_id, before_date.isoformat()))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            return {
+                "id": row["record_id"],
+                "decision_date": date.fromisoformat(row["record_date"]),
+                "action": row["action"],
+                "symbol": row["symbol"],
+                "thesis_type": row["thesis_type"],
+                "confidence": row["confidence"],
+                "rationale": row["rationale_summary"],
+                "outcome_1d": row["outcome_1d"],
+                "outcome_5d": row["outcome_5d"],
+                "outcome_21d": row["outcome_21d"],
+                "invalidation_triggered": bool(row["invalidation_triggered"])
+                    if row["invalidation_triggered"] is not None else None,
+            }
     
-    def _normalize_vector(self, vector: List[float]) -> np.ndarray:
-        """Normalize vector to unit length."""
-        arr = np.array(vector, dtype=float)
-        norm = np.linalg.norm(arr)
-        if norm > 0:
-            return arr / norm
-        return arr
-    
-    def _cosine_similarity(
+    def get_outcome(
         self,
-        vec1: np.ndarray,
-        vec2: List[float],
+        record_id: str,
+        horizon: str = "5d",
+    ) -> Optional[float]:
+        """
+        Get outcome for a specific record and horizon.
+        
+        Args:
+            record_id: Record ID
+            horizon: "1d", "5d", or "21d"
+            
+        Returns:
+            Outcome value or None
+        """
+        column = f"outcome_{horizon}"
+        if column not in ("outcome_1d", "outcome_5d", "outcome_21d"):
+            return None
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"SELECT {column} FROM experience_records WHERE record_id = ?",
+                (record_id,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+    
+    def check_invalidation_triggered(self, record_id: str) -> Optional[bool]:
+        """
+        Check if invalidation was triggered for a record.
+        
+        Args:
+            record_id: Record ID
+            
+        Returns:
+            True/False or None if not set
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT invalidation_triggered FROM experience_records "
+                "WHERE record_id = ?",
+                (record_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            return bool(row[0])
+    
+    def get_recent_accuracy(
+        self,
+        fund_id: str,
+        lookback_days: int = 20,
     ) -> float:
         """
-        Compute cosine similarity between two vectors.
+        Get recent accuracy (hit rate) for a fund.
         
         Args:
-            vec1: First vector (normalized)
-            vec2: Second vector (list)
+            fund_id: Fund ID
+            lookback_days: Number of days to look back
             
         Returns:
-            Similarity score (0-1)
+            Accuracy as fraction (0-1)
         """
-        vec2_arr = np.array(vec2, dtype=float)
-        vec2_norm = np.linalg.norm(vec2_arr)
+        cutoff = date.today().isoformat()
         
-        if vec2_norm == 0:
-            return 0.0
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT outcome_5d FROM experience_records
+                WHERE fund_id = ? 
+                AND record_date >= date(?, '-' || ? || ' days')
+                AND outcome_5d IS NOT NULL
+                AND action != 'hold'
+            """, (fund_id, cutoff, lookback_days))
+            
+            outcomes = [row[0] for row in cursor.fetchall()]
         
-        vec2_unit = vec2_arr / vec2_norm
+        if not outcomes:
+            return 0.5  # Default to 50% if no data
         
-        # Cosine similarity
-        similarity = np.dot(vec1, vec2_unit)
-        
-        # Clamp to [0, 1] (handle floating point errors)
-        return float(np.clip(similarity, 0, 1))
+        # Count wins (positive outcomes)
+        wins = sum(1 for o in outcomes if o > 0)
+        return wins / len(outcomes)
     
-    def count_experiences(
+    def _load_all(
         self,
         fund_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-    ) -> int:
+        with_outcomes: bool = False,
+    ) -> List[ExperienceRecord]:
         """
-        Count stored experiences.
+        Load all experience records.
         
         Args:
-            fund_id: Filter by fund
-            run_id: Filter by run
+            fund_id: Optional fund filter
+            with_outcomes: Only return records with outcomes
             
         Returns:
-            Number of experiences
+            List of ExperienceRecord
         """
-        with self.persistence.get_session() as session:
-            query = select(ExperienceRecord)
-            
-            if fund_id:
-                query = query.where(ExperienceRecord.fund_id == fund_id)
-            if run_id:
-                query = query.where(ExperienceRecord.run_id == run_id)
-            
-            count = len(session.execute(query).scalars().all())
+        query = "SELECT * FROM experience_records"
+        params: List[Any] = []
+        conditions = []
         
-        return count
+        if fund_id:
+            conditions.append("fund_id = ?")
+            params.append(fund_id)
+        
+        if with_outcomes:
+            conditions.append("outcome_5d IS NOT NULL")
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        records: List[ExperienceRecord] = []
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query, params)
+            
+            for row in cursor.fetchall():
+                records.append(ExperienceRecord(
+                    record_id=row["record_id"],
+                    record_date=date.fromisoformat(row["record_date"]),
+                    fund_id=row["fund_id"],
+                    state_features=json.loads(row["state_features"]),
+                    regime_tags=json.loads(row["regime_tags"]),
+                    action=row["action"],
+                    symbol=row["symbol"],
+                    thesis_type=row["thesis_type"],
+                    confidence=row["confidence"],
+                    rationale_summary=row["rationale_summary"] or "",
+                    counterfactual=row["counterfactual"] or "",
+                    outcome_1d=row["outcome_1d"],
+                    outcome_5d=row["outcome_5d"],
+                    outcome_21d=row["outcome_21d"],
+                    max_drawdown=row["max_drawdown"],
+                    invalidation_triggered=bool(row["invalidation_triggered"])
+                        if row["invalidation_triggered"] is not None else None,
+                ))
+        
+        return records
+    
+    def _extract_feature_vector(
+        self,
+        snapshot: GlobalMarketSnapshot,
+    ) -> Dict[str, float]:
+        """
+        Extract feature vector from snapshot for similarity search.
+        
+        Uses cross-sectional averages of returns and volatility.
+        """
+        features: Dict[str, float] = {}
+        
+        # Average returns across symbols
+        for period in ["1d", "5d", "21d", "63d"]:
+            returns = [
+                snapshot.get_return(sym, period)
+                for sym in snapshot.coverage_symbols
+            ]
+            valid_returns = [r for r in returns if r is not None]
+            if valid_returns:
+                features[f"avg_return_{period}"] = sum(valid_returns) / len(
+                    valid_returns
+                )
+        
+        # Average volatility
+        for period in ["5d", "21d"]:
+            vols = [
+                snapshot.get_volatility(sym, period)
+                for sym in snapshot.coverage_symbols
+            ]
+            valid_vols = [v for v in vols if v is not None]
+            if valid_vols:
+                features[f"avg_volatility_{period}"] = sum(valid_vols) / len(
+                    valid_vols
+                )
+        
+        return features
+    
+    def _detect_regime(
+        self,
+        snapshot: GlobalMarketSnapshot,
+    ) -> Dict[str, str]:
+        """
+        Detect market regime from snapshot.
+        
+        Returns tags for vol regime, trend regime, etc.
+        """
+        regime: Dict[str, str] = {}
+        
+        # Vol regime based on average 21d vol
+        vols = [
+            snapshot.get_volatility(sym, "21d")
+            for sym in snapshot.coverage_symbols
+        ]
+        valid_vols = [v for v in vols if v is not None]
+        
+        if valid_vols:
+            avg_vol = sum(valid_vols) / len(valid_vols)
+            if avg_vol < 0.015:
+                regime["vol"] = "low"
+            elif avg_vol > 0.025:
+                regime["vol"] = "high"
+            else:
+                regime["vol"] = "normal"
+        
+        # Trend regime based on average 21d returns
+        returns = [
+            snapshot.get_return(sym, "21d")
+            for sym in snapshot.coverage_symbols
+        ]
+        valid_returns = [r for r in returns if r is not None]
+        
+        if valid_returns:
+            avg_return = sum(valid_returns) / len(valid_returns)
+            if avg_return > 0.03:
+                regime["trend"] = "up"
+            elif avg_return < -0.03:
+                regime["trend"] = "down"
+            else:
+                regime["trend"] = "sideways"
+        
+        return regime
+    
+    def _summarize_conversation(
+        self,
+        conversation: List[AgentTurn],
+    ) -> str:
+        """
+        Create a brief summary of the conversation.
+        
+        Args:
+            conversation: List of agent turns
+            
+        Returns:
+            Summary string
+        """
+        if not conversation:
+            return ""
+        
+        # Get final positions
+        final_turns = conversation[-2:] if len(conversation) >= 2 else conversation
+        
+        summaries = []
+        for turn in final_turns:
+            summary = (
+                f"{turn.agent_id}: {turn.action} "
+                f"{turn.symbol or ''} "
+                f"({turn.thesis.thesis_type.value}, "
+                f"conf={turn.confidence.overall():.0%})"
+            )
+            summaries.append(summary)
+        
+        return " | ".join(summaries)
+    
+    def _extract_counterfactuals(
+        self,
+        conversation: List[AgentTurn],
+    ) -> str:
+        """
+        Extract counterfactuals from conversation.
+        
+        Args:
+            conversation: List of agent turns
+            
+        Returns:
+            Counterfactual summary
+        """
+        if not conversation:
+            return ""
+        
+        counterfactuals = []
+        for turn in conversation:
+            if turn.counterfactual:
+                cf = (
+                    f"{turn.agent_id}: considered {turn.counterfactual.alternative_action}, "
+                    f"rejected because {turn.counterfactual.why_rejected}"
+                )
+                counterfactuals.append(cf)
+        
+        return " | ".join(counterfactuals[:2])  # Limit to 2
 
 
-def create_experience_memory(
-    persistence: BacktestPersistence,
-) -> ExperienceMemory:
+# =============================================================================
+# Accountability Brief Generator
+# =============================================================================
+
+def generate_accountability_brief(
+    fund_id: str,
+    current_date: date,
+    experience_store: ExperienceStore,
+) -> str:
     """
-    Factory function to create experience memory.
+    Generate accountability brief from ACTUAL logged metrics.
+    
+    No LLM involvement - pure data from experience store.
     
     Args:
-        persistence: Persistence instance
+        fund_id: Fund ID
+        current_date: Current simulation date
+        experience_store: Experience store instance
         
     Returns:
-        Configured ExperienceMemory
+        Accountability brief string
     """
-    return ExperienceMemory(persistence)
+    prior = experience_store.get_latest_decision(fund_id, before_date=current_date)
+    
+    if not prior:
+        return "No prior decision to review."
+    
+    days_since = (current_date - prior["decision_date"]).days
+    
+    brief = f"""ACCOUNTABILITY BRIEF - {fund_id} - {current_date}
+
+PRIOR DECISION ({prior["decision_date"]}):
+- Action: {prior["action"]} {prior.get("symbol", "")}
+- Thesis: {prior.get("thesis_type", "unknown")}
+- Confidence: {prior.get("confidence", 0):.0%}
+"""
+    
+    if days_since >= 1 and prior.get("symbol"):
+        outcome_1d = prior.get("outcome_1d")
+        outcome_5d = prior.get("outcome_5d") if days_since >= 5 else None
+        
+        if outcome_1d is not None:
+            brief += f"""
+REALIZED OUTCOME:
+- 1-day return: {outcome_1d:+.2%}
+"""
+        
+        if outcome_5d is not None:
+            brief += f"- 5-day return: {outcome_5d:+.2%}\n"
+        
+        # Check invalidation
+        invalidation = prior.get("invalidation_triggered")
+        if invalidation is not None:
+            brief += f"- Invalidation triggered: {'YES' if invalidation else 'No'}\n"
+        
+        # Calibration note
+        recent_accuracy = experience_store.get_recent_accuracy(
+            fund_id, lookback_days=20
+        )
+        if recent_accuracy < 0.4:
+            brief += (
+                f"\nCALIBRATION WARNING: Recent accuracy {recent_accuracy:.0%} "
+                f"- consider scaling down confidence.\n"
+            )
+    
+    return brief

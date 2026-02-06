@@ -7,6 +7,8 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { FundCard } from '@/components/FundCard';
+import { DecisionQueue } from '@/components/DecisionQueue';
+import { EnhancedDecisionViewer } from '@/components/EnhancedDecisionViewer';
 import { api } from '@/lib/api';
 import type { Fund, DecisionRecord, FundStrategy } from '@/types';
 
@@ -37,6 +39,8 @@ export default function Dashboard() {
   const [isConnected, setIsConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [isTriggeringCycle, setIsTriggeringCycle] = useState(false);
+  const [selectedDecision, setSelectedDecision] = useState<string | null>(null);
+  const [showDecisionModal, setShowDecisionModal] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -57,8 +61,18 @@ export default function Dashboard() {
 
       // Load recent decisions from first fund (if any)
       if (fundsData.length > 0) {
-        const decisions = await api.getFundDecisions(fundsData[0].fundId, 5);
-        setRecentDecisions(decisions);
+        // Get decisions from all funds
+        const allDecisions = await Promise.all(
+          fundsData.map(fund => api.getFundDecisions(fund.fundId, 3))
+        );
+        const flatDecisions = allDecisions
+          .flat()
+          .sort((a, b) => 
+            new Date(b.asofTimestamp).getTime() - 
+            new Date(a.asofTimestamp).getTime()
+          )
+          .slice(0, 10);
+        setRecentDecisions(flatDecisions);
       }
 
       setLastUpdate(new Date());
@@ -239,52 +253,17 @@ export default function Dashboard() {
 
         {/* Sidebar */}
         <div className="space-y-6">
-          {/* Recent Decisions */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-lg">Recent Decisions</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {isLoading ? (
-                <div className="space-y-2">
-                  {[1, 2, 3].map(i => (
-                    <Skeleton key={i} className="h-12 w-full" />
-                  ))}
-                </div>
-              ) : recentDecisions.length > 0 ? (
-                <div className="space-y-2">
-                  {recentDecisions.map(decision => (
-                    <Link 
-                      key={decision.decisionId} 
-                      href={`/funds/${decision.fundId}?decision=${decision.decisionId}`}
-                      className="block"
-                    >
-                      <div className="flex items-center justify-between p-2 rounded-lg hover:bg-muted transition-colors">
-                        <div className="flex items-center gap-2">
-                          <Badge 
-                            variant={decision.decisionType === 'trade' ? 'default' : 'secondary'}
-                            className="text-xs"
-                          >
-                            {decision.decisionType}
-                          </Badge>
-                          <span className="text-xs text-muted-foreground">
-                            {new Date(decision.asofTimestamp).toLocaleTimeString()}
-                          </span>
-                        </div>
-                        <Badge variant="outline" className="text-xs">
-                          {decision.status}
-                        </Badge>
-                      </div>
-                    </Link>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground text-center py-4">
-                  No decisions yet. Run a trading cycle to generate decisions.
-                </p>
-              )}
-            </CardContent>
-          </Card>
+          {/* Recent Decisions - Enhanced */}
+          <DecisionQueue
+            decisions={recentDecisions}
+            isLoading={isLoading}
+            onDecisionClick={(id) => {
+              setSelectedDecision(id);
+              setShowDecisionModal(true);
+            }}
+            showFilters={false}
+            enableStreaming={false}
+          />
 
           {/* How It Works */}
           <Card>
@@ -348,6 +327,19 @@ export default function Dashboard() {
           </Card>
         </div>
       </div>
+      
+      {/* Decision Detail Modal */}
+      {showDecisionModal && selectedDecision && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6">
+          <div className="max-w-5xl w-full max-h-[90vh] overflow-auto">
+            <EnhancedDecisionViewer
+              decision={recentDecisions.find(d => d.decisionId === selectedDecision)!}
+              onClose={() => setShowDecisionModal(false)}
+              isStreaming={false}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

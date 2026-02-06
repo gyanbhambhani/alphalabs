@@ -45,7 +45,7 @@ async def list_decisions(
     fund_id: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    action: Optional[str] = Query(None, regex="^(buy|sell|hold)$"),
+    action: Optional[str] = Query(None, pattern="^(buy|sell|hold)$"),
     limit: int = Query(100, ge=1, le=1000),
 ) -> Dict[str, Any]:
     """

@@ -14,7 +14,7 @@ Orchestrates the backtest simulation with:
 import asyncio
 import uuid
 from datetime import date, datetime
-from typing import AsyncGenerator, Dict, List, Optional, TYPE_CHECKING
+from typing import AsyncGenerator, Dict, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field
 import logging
 import time
@@ -22,7 +22,12 @@ import time
 from core.backtest.data_loader import HistoricalDataLoader
 from core.backtest.snapshot_builder import PointInTimeSnapshotBuilder
 from core.backtest.portfolio_tracker import BacktestPortfolio, BacktestTrade
-from core.backtest.debate_runner import DailyDebateRunner, TradingDecision
+from core.backtest.debate_runner import (
+    DailyDebateRunner,
+    CollaborativeDebateRunner,
+    TradingDecision,
+    get_debate_runner,
+)
 from core.backtest.events import (
     BacktestEvent,
     DayTickEvent,
@@ -47,6 +52,31 @@ if TYPE_CHECKING:
     from core.backtest.persistence import BacktestPersistence
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Execution Guard Constants
+# =============================================================================
+
+MAX_SINGLE_POSITION_WEIGHT = 0.20  # 20% max concentration
+
+# Minimum holding periods by strategy (prevents churn)
+MIN_HOLDING_DAYS: Dict[str, int] = {
+    "momentum": 10,
+    "trend_macro": 10,
+    "mean_reversion": 2,
+    "volatility": 5,
+    "value": 20,
+    "quality_ls": 20,
+    "event_driven": 5,
+}
+
+
+@dataclass
+class ExecutionBlockResult:
+    """Result of execution guard checks."""
+    can_execute: bool
+    block_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +122,7 @@ class SimulationEngine:
         speed_multiplier: float = 100.0,
         initial_cash: float = 100_000.0,
         persistence: Optional["BacktestPersistence"] = None,
+        debate_version: str = "v2",
     ):
         """
         Initialize the simulation engine.
@@ -104,16 +135,20 @@ class SimulationEngine:
             speed_multiplier: Time dilation factor (100 = 100x speed)
             initial_cash: Starting cash per fund
             persistence: Optional persistence layer for saving training data
+            debate_version: "v1" for DailyDebateRunner, "v2" for CollaborativeDebateRunner
         """
         self.funds = funds
         self.data_loader = data_loader
         self.snapshot_builder = PointInTimeSnapshotBuilder(data_loader)
-        self.debate_runner = DailyDebateRunner()
+        self.debate_version = debate_version
+        self.debate_runner = get_debate_runner(version=debate_version)
         self.persistence = persistence
         
-        # Date range
+        # Date range - default to 2001-01-02 to ensure 1 year of historical data
+        # This gives V2 debate system enough return data (21d, 63d returns)
         trading_days = data_loader.trading_days
-        self.start_date = start_date or trading_days[0].date()
+        default_start = date(2001, 1, 2)  # Start 2001, not 2000
+        self.start_date = start_date or default_start
         self.end_date = end_date or trading_days[-1].date()
         
         # Get trading days in range
@@ -174,8 +209,17 @@ class SimulationEngine:
             for f in funds
         }
         
+        # Track trade counts per day for each fund
+        self.trade_counts: Dict[str, List[int]] = {
+            f.fund_id: []
+            for f in funds
+        }
+        
         # Store computed fund metrics
         self.fund_metrics: Dict[str, FundMetrics] = {}
+        
+        # Track last trade date per fund per symbol (for churn prevention)
+        self._last_trade_date: Dict[str, Dict[str, date]] = {}
     
     @property
     def progress(self) -> float:
@@ -240,17 +284,245 @@ class SimulationEngine:
         return self.trade_budgets[fund_id]
     
     def _infer_rebalance_cadence(self, fund_thesis: str) -> str:
-        """Infer rebalance cadence from fund thesis (temporary)."""
+        """
+        Get default rebalance cadence for fund type.
+        
+        Uses strategy-specific cadences for sensible defaults.
+        """
         thesis_lower = fund_thesis.lower()
         
-        if "mean reversion" in thesis_lower or "intraday" in thesis_lower:
-            return "daily"
-        elif "quality" in thesis_lower or "value" in thesis_lower:
-            return "monthly"
-        elif "momentum" in thesis_lower or "trend" in thesis_lower:
-            return "weekly"
-        else:
-            return "weekly"  # Default
+        cadence_map = {
+            "momentum": "weekly",
+            "trend_macro": "weekly",
+            "mean_reversion": "daily",
+            "value": "monthly",
+            "quality_ls": "monthly",
+            "event_driven": "weekly",
+            "volatility": "weekly",
+        }
+        
+        for key, cadence in cadence_map.items():
+            if key in thesis_lower:
+                return cadence
+        
+        return "weekly"  # Conservative default
+    
+    def _validate_price_for_trade(
+        self,
+        symbol: str,
+        snapshot: GlobalMarketSnapshot,
+    ) -> Tuple[bool, str]:
+        """
+        Ensure we have a valid price before trading.
+        
+        Args:
+            symbol: Stock symbol
+            snapshot: Market data snapshot
+            
+        Returns:
+            Tuple of (is_valid, reason_if_invalid)
+        """
+        price = snapshot.get_price(symbol)
+        
+        if price is None:
+            return False, f"No price available for {symbol}"
+        
+        if price <= 0:
+            return False, f"Invalid price {price} for {symbol}"
+        
+        return True, ""
+    
+    def _should_execute_buy(
+        self,
+        symbol: str,
+        target_weight: float,
+        portfolio: BacktestPortfolio,
+        budget: TradeBudget,
+        price: float,
+    ) -> ExecutionBlockResult:
+        """
+        Check if buy should execute given current holdings.
+        
+        Guards:
+        1. Already at or above target weight
+        2. Delta too small (hysteresis)
+        3. Would exceed max concentration
+        4. Quantity check (ensure we're buying positive shares)
+        
+        Args:
+            symbol: Stock symbol
+            target_weight: Target portfolio weight
+            portfolio: Current portfolio state
+            budget: Trade budget constraints
+            price: Current price
+            
+        Returns:
+            ExecutionBlockResult with can_execute and block_reasons
+        """
+        reasons: List[str] = []
+        current_weight = portfolio.get_position_weight(symbol)
+        
+        # Guard 1: Already at or above target
+        if current_weight >= target_weight:
+            reasons.append(
+                f"Already at {current_weight:.1%}, target {target_weight:.1%}"
+            )
+        
+        # Guard 2: Delta too small (hysteresis via TradeBudget)
+        if budget and not budget.should_trade(current_weight, target_weight, price):
+            delta = target_weight - current_weight
+            reasons.append(f"Delta {delta:.1%} below threshold")
+        
+        # Guard 3: Max concentration
+        if target_weight > MAX_SINGLE_POSITION_WEIGHT:
+            reasons.append(
+                f"Target {target_weight:.1%} exceeds max "
+                f"{MAX_SINGLE_POSITION_WEIGHT:.1%}"
+            )
+        
+        # Guard 4: Quantity sanity check
+        if price > 0:
+            target_value = portfolio.total_value * target_weight
+            current_value = portfolio.total_value * current_weight
+            buy_value = target_value - current_value
+            buy_qty = int(buy_value / price)
+            if buy_qty <= 0:
+                reasons.append(f"Computed buy quantity {buy_qty} <= 0")
+        
+        return ExecutionBlockResult(
+            can_execute=len(reasons) == 0,
+            block_reasons=reasons,
+        )
+    
+    def _should_execute_sell(
+        self,
+        symbol: str,
+        target_weight: float,
+        portfolio: BacktestPortfolio,
+        price: float,
+    ) -> ExecutionBlockResult:
+        """
+        Check if sell should execute.
+        
+        Guards:
+        1. Don't hold the symbol
+        2. Current shares <= 0
+        3. Already at or below target
+        4. Sell quantity sanity (don't sell more than we have)
+        
+        Args:
+            symbol: Stock symbol
+            target_weight: Target portfolio weight
+            portfolio: Current portfolio state
+            price: Current price
+            
+        Returns:
+            ExecutionBlockResult with can_execute and block_reasons
+        """
+        reasons: List[str] = []
+        
+        # Guard 1: Don't hold the symbol
+        if symbol not in portfolio.positions:
+            reasons.append(f"Cannot sell {symbol} - not in portfolio")
+            return ExecutionBlockResult(can_execute=False, block_reasons=reasons)
+        
+        position = portfolio.positions[symbol]
+        current_weight = portfolio.get_position_weight(symbol)
+        
+        # Guard 2: Current shares <= 0
+        if position.quantity <= 0:
+            reasons.append(
+                f"Cannot sell {symbol} - quantity {position.quantity} <= 0"
+            )
+        
+        # Guard 3: Already at or below target
+        if current_weight <= target_weight:
+            reasons.append(
+                f"Already at {current_weight:.1%}, target {target_weight:.1%}"
+            )
+        
+        # Guard 4: Sell quantity sanity
+        if price > 0 and position.quantity > 0:
+            target_value = portfolio.total_value * target_weight
+            current_value = position.quantity * price
+            sell_value = current_value - target_value
+            sell_qty = int(sell_value / price)
+            if sell_qty > position.quantity:
+                reasons.append(
+                    f"Sell qty {sell_qty} > held qty {position.quantity}"
+                )
+        
+        return ExecutionBlockResult(
+            can_execute=len(reasons) == 0,
+            block_reasons=reasons,
+        )
+    
+    def _check_churn_guard(
+        self,
+        fund_id: str,
+        fund_strategy: str,
+        symbol: str,
+        action: str,
+        current_date: date,
+    ) -> Tuple[bool, str]:
+        """
+        Check if trade violates minimum holding period.
+        
+        Only applies to sells/reduces - you can always buy more.
+        
+        Args:
+            fund_id: Fund identifier
+            fund_strategy: Fund's strategy
+            symbol: Stock symbol
+            action: Trade action
+            current_date: Current simulation date
+            
+        Returns:
+            Tuple of (can_trade, reason_if_blocked)
+        """
+        if action == "buy":
+            return True, ""  # Buys always allowed (other guards handle duplicates)
+        
+        # Get last trade date for this symbol in this fund
+        fund_trades = self._last_trade_date.get(fund_id, {})
+        last_date = fund_trades.get(symbol)
+        
+        if last_date is None:
+            return True, ""  # Never traded, can sell
+        
+        # Get min holding period for strategy
+        strategy_key = fund_strategy.lower().split()[0]
+        min_days = MIN_HOLDING_DAYS.get(strategy_key, 5)
+        
+        days_held = (current_date - last_date).days
+        if days_held < min_days:
+            return False, (
+                f"Churn guard: {symbol} bought {days_held}d ago, "
+                f"min hold {min_days}d for {strategy_key}"
+            )
+        
+        return True, ""
+    
+    def _record_trade(
+        self,
+        fund_id: str,
+        symbol: str,
+        action: str,
+        current_date: date,
+    ) -> None:
+        """
+        Record trade date for churn prevention.
+        
+        Args:
+            fund_id: Fund identifier
+            symbol: Stock symbol
+            action: Trade action
+            current_date: Current simulation date
+        """
+        if action == "buy":
+            if fund_id not in self._last_trade_date:
+                self._last_trade_date[fund_id] = {}
+            self._last_trade_date[fund_id][symbol] = current_date
     
     def set_speed(self, multiplier: float) -> None:
         """Change simulation speed."""
@@ -602,6 +874,14 @@ class SimulationEngine:
                 tokens_used=msg.tokens_used,
             ))
         
+        # Generate decision ID for tracking
+        decision_id = f"{self.run_id}_{fund.fund_id}_{current_date.isoformat()}"
+        
+        # Determine status based on action
+        # hold = finalized (no execution needed)
+        # buy/sell = will be executed next
+        status = "finalized" if decision.action == "hold" else "sent_to_broker"
+        
         # Emit decision
         await self.emit_event(DecisionEvent(
             timestamp=datetime.utcnow(),
@@ -614,6 +894,8 @@ class SimulationEngine:
             reasoning=decision.reasoning,
             confidence=decision.confidence,
             signals_used=decision.signals_used,
+            status=status,
+            decision_id=decision_id,
         ))
         
         # Save decision to persistence
@@ -685,20 +967,50 @@ class SimulationEngine:
         snapshot: GlobalMarketSnapshot,
         current_date: date,
     ) -> Optional[BacktestTrade]:
-        """Execute a trading decision."""
+        """
+        Execute a trading decision with execution guards.
+        
+        Guards applied:
+        1. Price validation (must exist and be positive)
+        2. Buy guards (duplicate, concentration, quantity)
+        3. Sell guards (held, quantity)
+        4. Churn guard (minimum holding period)
+        """
         if not decision.symbol:
             return None
         
-        price = snapshot.get_price(decision.symbol)
-        if not price:
-            logger.warning(f"No price for {decision.symbol}")
+        # GUARD 1: Price validation
+        price_valid, price_reason = self._validate_price_for_trade(
+            decision.symbol, snapshot
+        )
+        if not price_valid:
+            logger.warning(f"[{fund.fund_id}] {price_reason}")
             return None
+        
+        price = snapshot.get_price(decision.symbol)
+        target_weight = decision.target_weight or 0.1
+        
+        # Get budget for buy guards
+        budget = self.trade_budgets.get(fund.fund_id)
         
         try:
             if decision.action == "buy":
+                # GUARD 2: Buy-side guards
+                buy_check = self._should_execute_buy(
+                    decision.symbol, target_weight, portfolio, budget, price
+                )
+                if not buy_check.can_execute:
+                    logger.info(
+                        f"[{fund.fund_id}] Buy blocked: {buy_check.block_reasons}"
+                    )
+                    return None
+                
                 # Calculate quantity from target weight
-                target_value = portfolio.total_value * (decision.target_weight or 0.1)
-                quantity = int(target_value / price)
+                target_value = portfolio.total_value * target_weight
+                current_weight = portfolio.get_position_weight(decision.symbol)
+                current_value = portfolio.total_value * current_weight
+                buy_value = target_value - current_value
+                quantity = int(buy_value / price)
                 
                 if quantity <= 0:
                     return None
@@ -780,15 +1092,45 @@ class SimulationEngine:
                     commission=commission,
                     total_cost=quantity * price + commission,
                     reasoning=decision.reasoning,
+                    decision_id=decision_id,
                 ))
+                
+                # Record trade for churn prevention
+                self._record_trade(fund.fund_id, decision.symbol, "buy", current_date)
                 
                 return trade
                 
             elif decision.action == "sell":
-                if decision.symbol not in portfolio.positions:
+                # GUARD 3: Sell-side guards
+                sell_check = self._should_execute_sell(
+                    decision.symbol, 0.0, portfolio, price  # target_weight=0 for full sell
+                )
+                if not sell_check.can_execute:
+                    logger.info(
+                        f"[{fund.fund_id}] Sell blocked: {sell_check.block_reasons}"
+                    )
+                    return None
+                
+                # GUARD 4: Churn guard (minimum holding period)
+                churn_ok, churn_reason = self._check_churn_guard(
+                    fund.fund_id, fund.thesis, decision.symbol, "sell", current_date
+                )
+                if not churn_ok:
+                    logger.info(f"[{fund.fund_id}] {churn_reason}")
                     return None
                 
                 pos = portfolio.positions[decision.symbol]
+                
+                # Check minimum holding period (prevent panic selling)
+                if not pos.can_sell(current_date, min_hold_days=3):
+                    days_held = pos.days_held(current_date)
+                    logger.info(
+                        f"[{fund.fund_id}] Sell blocked: {decision.symbol} "
+                        f"held only {days_held} days (min 3), "
+                        f"loss {pos.unrealized_return:.1%} (need >15% for override)"
+                    )
+                    return None
+                
                 quantity = pos.quantity
                 
                 commission = max(
@@ -804,6 +1146,9 @@ class SimulationEngine:
                     timestamp=datetime.combine(current_date, datetime.min.time()),
                     reasoning=decision.reasoning,
                 )
+                
+                # Generate decision_id for sell
+                sell_decision_id = f"{self.run_id}_{fund.fund_id}_{current_date.isoformat()}"
                 
                 # Record trade exit for outcome tracking
                 slippage_bps = commission / (quantity * price) * 10000  # Basis points
@@ -854,6 +1199,7 @@ class SimulationEngine:
                     commission=commission,
                     total_cost=-(quantity * price - commission),
                     reasoning=decision.reasoning,
+                    decision_id=sell_decision_id,
                 ))
                 
                 return trade

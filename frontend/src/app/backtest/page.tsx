@@ -4,6 +4,9 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { DecisionQueue } from '@/components/DecisionQueue';
+import { EnhancedDecisionViewer } from '@/components/EnhancedDecisionViewer';
+import { DecisionRecord, DebateTranscript } from '@/types';
 
 // Types
 interface FundRanking {
@@ -24,6 +27,8 @@ interface Decision {
   reasoning: string;
   confidence: number;
   simulation_date: string;
+  decision_id?: string;
+  status?: string;
 }
 
 interface DebateMessage {
@@ -182,10 +187,15 @@ function formatDate(dateStr: string): string {
   });
 }
 
-// Check if reasoning contains a parse error
-function isParseError(reasoning: string): boolean {
-  return reasoning.toLowerCase().includes('parse error') || 
-         reasoning.toLowerCase().includes('extra data:');
+// Check if reasoning contains an error that should be filtered out
+function isErrorReasoning(reasoning: string): boolean {
+  const lowerReasoning = reasoning.toLowerCase();
+  return lowerReasoning.includes('parse error') || 
+         lowerReasoning.includes('extra data:') ||
+         lowerReasoning.includes('re-identification failed') ||
+         lowerReasoning.includes('api key not valid') ||
+         lowerReasoning.includes('invalid_argument') ||
+         lowerReasoning.includes('error calling model');
 }
 
 export default function BacktestPage() {
@@ -215,6 +225,8 @@ export default function BacktestPage() {
     total: number;
     symbol: string;
   } | null>(null);
+  const [selectedDecision, setSelectedDecision] = useState<string | null>(null);
+  const [showDecisionModal, setShowDecisionModal] = useState(false);
   
   // Historical runs
   interface HistoricalRun {
@@ -379,6 +391,8 @@ export default function BacktestPage() {
               reasoning: event.reasoning,
               confidence: event.confidence,
               simulation_date: event.simulation_date,
+              decision_id: event.decision_id || `${event.fund_id}_${Date.now()}`,
+              status: event.status || 'finalized',
             },
             ...prev.decisions.slice(0, 99), // Keep last 100
           ],
@@ -423,6 +437,25 @@ export default function BacktestPage() {
         setState(prev => ({
           ...prev,
           leaderboard: event.rankings || [],
+        }));
+        break;
+      
+      case 'trade_executed':
+        // Update the decision status to 'filled' when trade is executed
+        setState(prev => ({
+          ...prev,
+          decisions: prev.decisions.map(d => {
+            // Match by decision_id if available, otherwise by fund_id + symbol
+            const decisionId = d.decision_id || `${d.fund_id}_${d.simulation_date}`;
+            if (event.decision_id && decisionId === event.decision_id) {
+              return { ...d, status: 'filled' };
+            }
+            // Fallback: match by fund_id and symbol (for older events)
+            if (!event.decision_id && d.fund_id === event.fund_id && d.symbol === event.symbol) {
+              return { ...d, status: 'filled' };
+            }
+            return d;
+          }),
         }));
         break;
         
@@ -897,82 +930,32 @@ export default function BacktestPage() {
               </Card>
             </div>
 
-            {/* Decision Stream */}
+            {/* Decision Stream - Enhanced */}
             <div className="col-span-4">
-              <Card className="h-[420px] bg-zinc-900 border-zinc-800">
-                <CardHeader className="pb-3 border-b border-zinc-800">
-                  <CardTitle className="text-sm font-medium text-zinc-300">
-                    Decision Stream
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-3 overflow-auto h-[calc(100%-60px)]">
-                  {state.decisions.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center h-full 
-                                    text-zinc-500">
-                      <p className="text-sm">AI fund managers are thinking...</p>
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      {state.decisions
-                        .filter(d => !isParseError(d.reasoning))
-                        .slice(0, 12)
-                        .map((decision, i) => {
-                          const theme = getFundTheme(decision.fund_id, funds);
-                          const isBuy = decision.action.toLowerCase() === 'buy';
-                          const isSell = decision.action.toLowerCase() === 'sell';
-                          const isHold = decision.action.toLowerCase() === 'hold';
-                          
-                          return (
-                            <div 
-                              key={i} 
-                              className={cn(
-                                "p-3 rounded-lg border",
-                                `bg-zinc-900 ${theme.border}`
-                              )}
-                            >
-                              <div className="flex items-center justify-between mb-2">
-                                <span className="font-medium text-white text-sm">
-                                  {decision.fund_name}
-                                </span>
-                                <span className="text-xs text-zinc-500">
-                                  {decision.simulation_date && 
-                                    formatDate(decision.simulation_date)}
-                                </span>
-                              </div>
-                              
-                              <div className="flex items-center gap-2 mb-2">
-                                <span className={cn(
-                                  "px-2 py-0.5 rounded text-xs font-bold uppercase",
-                                  isBuy && "bg-green-900 text-green-400",
-                                  isSell && "bg-red-900 text-red-400",
-                                  isHold && "bg-zinc-800 text-zinc-400"
-                                )}>
-                                  {decision.action}
-                                </span>
-                                {decision.symbol && (
-                                  <span className="font-mono font-bold text-white">
-                                    {decision.symbol}
-                                  </span>
-                                )}
-                                {decision.confidence > 0 && (
-                                  <span className="text-xs text-zinc-500 ml-auto">
-                                    {(decision.confidence * 100).toFixed(0)}% conf
-                                  </span>
-                                )}
-                              </div>
-                              
-                              <p className="text-xs text-zinc-400 leading-relaxed 
-                                            line-clamp-2">
-                                {decision.reasoning}
-                              </p>
-                            </div>
-                          );
-                        })}
-                      <div ref={decisionsEndRef} />
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
+              <DecisionQueue
+                decisions={state.decisions
+                  .filter(d => !isErrorReasoning(d.reasoning))
+                  .slice(0, 20)
+                  .map(d => ({
+                    decisionId: d.decision_id || `${d.fund_id}_${d.simulation_date}`,
+                    fundId: d.fund_name,
+                    asofTimestamp: d.simulation_date,
+                    status: (d.status || 'finalized') as any,
+                    decisionType: d.action.toLowerCase() === 'hold' ? 'no_trade' : 'trade',
+                    noTradeReason: d.action.toLowerCase() === 'hold' ? d.reasoning : undefined,
+                    predictedDirections: d.symbol ? { [d.symbol]: d.action.toLowerCase() === 'buy' ? 'up' : 'down' } : {},
+                    expectedReturn: d.confidence > 0 ? d.confidence * 0.1 : undefined,
+                    expectedHoldingDays: d.action.toLowerCase() !== 'hold' ? 5 : undefined,
+                    snapshotId: '',
+                  } as DecisionRecord))}
+                isLoading={state.isRunning && state.decisions.length === 0}
+                onDecisionClick={(id) => {
+                  setSelectedDecision(id);
+                  setShowDecisionModal(true);
+                }}
+                showFilters={true}
+                enableStreaming={state.isRunning}
+              />
             </div>
 
             {/* Portfolio View */}
@@ -1095,21 +1078,35 @@ export default function BacktestPage() {
                 <div className="grid grid-cols-2 gap-3 max-h-[280px] overflow-auto">
                   {state.debates.slice(0, 8).map((msg, i) => {
                     const theme = getFundTheme(msg.fund_id, funds);
+                    // Only flag as error if it's an actual API/system error, not just
+                    // the word "error" in analysis text
+                    const contentLower = msg.content.toLowerCase();
+                    const isError = (
+                      contentLower.includes('api key') ||
+                      contentLower.includes('api error') ||
+                      contentLower.includes('invalid_argument') ||
+                      contentLower.includes('authentication') ||
+                      contentLower.startsWith('error:') ||
+                      contentLower.startsWith('error calling')
+                    );
                     const phaseColors: Record<string, string> = {
                       'analyze': 'bg-blue-900 text-blue-400',
                       'propose': 'bg-green-900 text-green-400',
                       'decide': 'bg-amber-900 text-amber-400',
                       'confirm': 'bg-purple-900 text-purple-400',
                     };
-                    const phaseColor = phaseColors[msg.phase] || 
-                      'bg-zinc-800 text-zinc-400';
+                    const phaseColor = isError 
+                      ? 'bg-red-900 text-red-400' 
+                      : (phaseColors[msg.phase] || 'bg-zinc-800 text-zinc-400');
                     
                     return (
                       <div 
                         key={i} 
                         className={cn(
                           "p-3 rounded-lg border",
-                          `bg-zinc-900 ${theme.border}`
+                          isError 
+                            ? "bg-red-950/30 border-red-800" 
+                            : `bg-zinc-900 ${theme.border}`
                         )}
                       >
                         <div className="flex items-center gap-2 mb-2">
@@ -1117,15 +1114,20 @@ export default function BacktestPage() {
                             "px-2 py-0.5 rounded text-xs font-medium uppercase",
                             phaseColor
                           )}>
-                            {msg.phase}
+                            {isError ? 'ERROR' : msg.phase}
                           </span>
                           <span className="text-xs text-zinc-500 font-mono">
                             {msg.model}
                           </span>
                         </div>
-                        <p className="text-xs text-zinc-400 leading-relaxed line-clamp-4">
-                          {msg.content.slice(0, 300)}
-                          {msg.content.length > 300 && '...'}
+                        <p className={cn(
+                          "text-xs leading-relaxed line-clamp-4",
+                          isError ? "text-red-400" : "text-zinc-400"
+                        )}>
+                          {isError 
+                            ? `API Error: Check your ${msg.model} API key` 
+                            : msg.content.slice(0, 300)}
+                          {!isError && msg.content.length > 300 && '...'}
                         </p>
                       </div>
                     );
@@ -1273,6 +1275,68 @@ export default function BacktestPage() {
         </>
       )}
       </div>
+      
+      {/* Decision Detail Modal */}
+      {showDecisionModal && selectedDecision && (() => {
+        // Find the decision
+        const decision = state.decisions.find(
+          d => (d.decision_id || `${d.fund_id}_${d.simulation_date}`) === selectedDecision
+        );
+        
+        if (!decision) return null;
+        
+        // Build transcript from debate messages for this fund
+        const fundDebates = state.debates.filter(d => d.fund_id === decision.fund_id);
+        const transcript: DebateTranscript | undefined = fundDebates.length > 0 ? {
+          transcriptId: selectedDecision,
+          fundId: decision.fund_id,
+          snapshotId: '',
+          startedAt: decision.simulation_date,
+          completedAt: decision.simulation_date,
+          numProposals: fundDebates.filter(d => d.phase === 'propose').length,
+          numCritiques: 0,
+          finalConsensusLevel: decision.confidence,
+          messages: fundDebates.map(d => ({
+            phase: d.phase.toUpperCase(),
+            participantId: d.model,
+            timestamp: new Date().toISOString(),
+            content: { text: d.content },
+            modelName: d.model,
+            modelVersion: '1.0',
+            promptHash: '',
+          })),
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+        } : undefined;
+        
+        const decisionRecord: DecisionRecord = {
+          decisionId: decision.decision_id || `${decision.fund_id}_${decision.simulation_date}`,
+          fundId: decision.fund_name,
+          asofTimestamp: decision.simulation_date,
+          status: (decision.status || 'finalized') as any,
+          decisionType: decision.action.toLowerCase() === 'hold' ? 'no_trade' : 'trade',
+          noTradeReason: decision.action.toLowerCase() === 'hold' ? decision.reasoning : undefined,
+          predictedDirections: decision.symbol 
+            ? { [decision.symbol]: decision.action.toLowerCase() === 'buy' ? 'up' : 'down' } 
+            : {},
+          expectedReturn: decision.confidence > 0 ? decision.confidence * 0.1 : undefined,
+          expectedHoldingDays: decision.action.toLowerCase() !== 'hold' ? 5 : undefined,
+          snapshotId: '',
+        };
+        
+        return (
+          <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-6">
+            <div className="max-w-5xl w-full max-h-[90vh] overflow-auto">
+              <EnhancedDecisionViewer
+                decision={decisionRecord}
+                transcript={transcript}
+                onClose={() => setShowDecisionModal(false)}
+                isStreaming={state.isRunning}
+              />
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

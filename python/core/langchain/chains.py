@@ -1,21 +1,14 @@
 """
 LangChain chains for debate orchestration.
 
-These chains implement the 4-phase debate:
-1. ANALYZE (Gemini) - Analyze market conditions
-2. PROPOSE (GPT) - Propose specific trades
-3. DECIDE (GPT) - Make final decision with structured output
-4. CONFIRM (Claude) - Risk manager review for major trades
+Simplified chains using direct JSON output instead of complex Pydantic parsing.
 """
 
 import os
+import json
 import logging
 from typing import Dict, Any, Optional
 from pathlib import Path
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.runnables import RunnableSequence
 
 from core.langchain.schemas import (
     MarketAnalysis,
@@ -55,22 +48,7 @@ def get_openai_llm(model: str = "gpt-4o-mini", temperature: float = 0.7):
         model=model,
         temperature=temperature,
         api_key=api_key,
-        max_tokens=500,
-    )
-
-
-def get_gemini_llm(model: str = "gemini-1.5-flash", temperature: float = 0.7):
-    """Get Google Gemini LLM instance."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY not set")
-    
-    return ChatGoogleGenerativeAI(
-        model=model,
-        temperature=temperature,
-        google_api_key=api_key,
+        max_tokens=1000,
     )
 
 
@@ -86,159 +64,201 @@ def get_anthropic_llm(model: str = "claude-3-haiku-20240307", temperature: float
         model=model,
         temperature=temperature,
         api_key=api_key,
-        max_tokens=200,
+        max_tokens=500,
     )
 
 
+def get_llm_for_model(model: str, temperature: float = 0.7):
+    """Get the appropriate LLM based on model name."""
+    model_lower = model.lower()
+    
+    if model_lower.startswith("gpt") or model_lower.startswith("o1"):
+        return get_openai_llm(model, temperature)
+    
+    if model_lower.startswith("claude"):
+        return get_anthropic_llm(model, temperature)
+    
+    # Default to OpenAI
+    logger.warning(f"Unknown model {model}, defaulting to gpt-4o-mini")
+    return get_openai_llm("gpt-4o-mini", temperature)
+
+
+def extract_json(text: str) -> Optional[Dict]:
+    """Extract JSON from LLM response, handling markdown code blocks."""
+    # Try to find JSON in code blocks first
+    if "```json" in text:
+        start = text.find("```json") + 7
+        end = text.find("```", start)
+        if end > start:
+            text = text[start:end].strip()
+    elif "```" in text:
+        start = text.find("```") + 3
+        end = text.find("```", start)
+        if end > start:
+            text = text[start:end].strip()
+    
+    # Try to find JSON object
+    try:
+        # Find first { and last }
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except json.JSONDecodeError:
+        pass
+    
+    return None
+
+
 # ============================================================================
-# Phase 1: ANALYZE Chain (Gemini)
+# Phase 1: ANALYZE Chain
 # ============================================================================
 
-ANALYZE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a market analyst for an AI hedge fund.
-Analyze market conditions and identify trading opportunities."""),
-    ("human", """{context}
+ANALYZE_SYSTEM = """You are a market analyst for an AI hedge fund.
+Analyze market conditions and identify trading opportunities.
+Always respond with valid JSON only, no other text."""
 
-Analyze the current market conditions and identify:
-1. Key opportunities based on recent price movements
-2. Risk factors to consider
-3. Symbols that align with the fund's thesis
+ANALYZE_USER = """{context}
 
-Keep your analysis concise (200 words max). Focus on actionable insights.
+Analyze the current market conditions. Respond with this exact JSON format:
+{{
+    "opportunities": ["opportunity 1", "opportunity 2"],
+    "risk_factors": ["risk 1", "risk 2"],
+    "recommended_symbols": ["SYM1", "SYM2"],
+    "market_regime": "bullish|bearish|neutral|volatile",
+    "summary": "Brief summary of analysis"
+}}
 
-{format_instructions}""")
-])
+Respond with JSON only."""
 
 
 class AnalyzeChain:
-    """
-    Phase 1: Market analysis using Gemini.
+    """Phase 1: Market analysis."""
     
-    Analyzes market conditions and identifies opportunities.
-    """
-    
-    def __init__(self, model: str = "gemini-1.5-flash"):
+    def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
-        self.parser = PydanticOutputParser(pydantic_object=MarketAnalysis)
         self._llm = None
     
     def _get_llm(self):
         if self._llm is None:
-            try:
-                self._llm = get_gemini_llm(self.model)
-            except ValueError:
-                # Fallback to OpenAI if Gemini not available
-                logger.warning("Gemini not available, falling back to OpenAI")
-                self._llm = get_openai_llm()
+            self._llm = get_llm_for_model(self.model)
         return self._llm
     
     async def ainvoke(self, inputs: Dict[str, Any]) -> MarketAnalysis:
         """Run analysis chain asynchronously."""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
         llm = self._get_llm()
+        context = inputs.get("context", "")
         
-        prompt = ANALYZE_PROMPT.format_messages(
-            context=inputs.get("context", ""),
-            format_instructions=self.parser.get_format_instructions(),
+        messages = [
+            SystemMessage(content=ANALYZE_SYSTEM),
+            HumanMessage(content=ANALYZE_USER.format(context=context)),
+        ]
+        
+        response = await llm.ainvoke(messages)
+        
+        data = extract_json(response.content)
+        if data:
+            try:
+                return MarketAnalysis(**data)
+            except Exception as e:
+                logger.warning(f"Failed to create MarketAnalysis: {e}")
+        
+        # Fallback
+        return MarketAnalysis(
+            opportunities=["Analysis parsing failed"],
+            risk_factors=["Unable to parse response"],
+            recommended_symbols=[],
+            market_regime="unknown",
+            summary=response.content[:500] if response.content else "Analysis failed"
         )
-        
-        response = await llm.ainvoke(prompt)
-        
-        try:
-            return self.parser.parse(response.content)
-        except Exception as e:
-            logger.warning(f"Failed to parse analysis: {e}")
-            # Return fallback analysis
-            return MarketAnalysis(
-                opportunities=["Unable to parse opportunities"],
-                risk_factors=["Analysis parsing failed"],
-                recommended_symbols=[],
-                market_regime="unknown",
-                summary=response.content[:500] if response.content else "Analysis failed"
-            )
-    
-    def invoke(self, inputs: Dict[str, Any]) -> MarketAnalysis:
-        """Run analysis chain synchronously."""
-        import asyncio
-        return asyncio.run(self.ainvoke(inputs))
 
 
 # ============================================================================
-# Phase 2: PROPOSE Chain (GPT)
+# Phase 2: PROPOSE Chain
 # ============================================================================
 
-PROPOSE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a portfolio manager for an AI hedge fund.
-Propose specific trades based on market analysis."""),
-    ("human", """{context}
+PROPOSE_SYSTEM = """You are a portfolio manager for an AI hedge fund.
+Propose specific trades based on market analysis.
+Always respond with valid JSON only, no other text."""
+
+PROPOSE_USER = """{context}
 
 MARKET ANALYSIS:
 {analysis}
 
-Based on the analysis and fund thesis, propose specific trades.
-Consider:
-1. Position sizing (max 20% per position)
-2. Current portfolio allocation
-3. Risk management
+Based on the analysis and fund thesis, propose ONE specific trade.
+Position sizing: max 20% per position.
 
-{format_instructions}""")
-])
+Respond with this exact JSON format:
+{{
+    "action": "buy|sell|hold",
+    "symbol": "TICKER" or null,
+    "target_weight": 0.10,
+    "reasoning": "Why this trade",
+    "risk_assessment": "Risks of this trade"
+}}
+
+Respond with JSON only."""
 
 
 class ProposeChain:
-    """
-    Phase 2: Trade proposal using GPT.
-    
-    Proposes specific trades based on analysis.
-    """
+    """Phase 2: Trade proposal."""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
-        self.parser = PydanticOutputParser(pydantic_object=TradeProposal)
         self._llm = None
     
     def _get_llm(self):
         if self._llm is None:
-            self._llm = get_openai_llm(self.model)
+            self._llm = get_llm_for_model(self.model)
         return self._llm
     
     async def ainvoke(self, inputs: Dict[str, Any]) -> TradeProposal:
         """Run proposal chain asynchronously."""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
         llm = self._get_llm()
+        context = inputs.get("context", "")
+        analysis = inputs.get("analysis", "")
         
-        prompt = PROPOSE_PROMPT.format_messages(
-            context=inputs.get("context", ""),
-            analysis=inputs.get("analysis", ""),
-            format_instructions=self.parser.get_format_instructions(),
+        messages = [
+            SystemMessage(content=PROPOSE_SYSTEM),
+            HumanMessage(content=PROPOSE_USER.format(
+                context=context,
+                analysis=analysis
+            )),
+        ]
+        
+        response = await llm.ainvoke(messages)
+        
+        data = extract_json(response.content)
+        if data:
+            try:
+                return TradeProposal(**data)
+            except Exception as e:
+                logger.warning(f"Failed to create TradeProposal: {e}")
+        
+        # Fallback
+        return TradeProposal(
+            action="hold",
+            symbol=None,
+            target_weight=None,
+            reasoning="Proposal parsing failed",
+            risk_assessment="Unable to assess"
         )
-        
-        response = await llm.ainvoke(prompt)
-        
-        try:
-            return self.parser.parse(response.content)
-        except Exception as e:
-            logger.warning(f"Failed to parse proposal: {e}")
-            return TradeProposal(
-                action="hold",
-                symbol=None,
-                target_weight=None,
-                reasoning=response.content[:500] if response.content else "Proposal failed",
-                risk_assessment="Unable to assess risk due to parsing error"
-            )
-    
-    def invoke(self, inputs: Dict[str, Any]) -> TradeProposal:
-        """Run proposal chain synchronously."""
-        import asyncio
-        return asyncio.run(self.ainvoke(inputs))
 
 
 # ============================================================================
-# Phase 3: DECIDE Chain (GPT with structured output)
+# Phase 3: DECIDE Chain
 # ============================================================================
 
-DECIDE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are the final decision maker for an AI hedge fund.
-Make trading decisions based on analysis and proposals."""),
-    ("human", """{context}
+DECIDE_SYSTEM = """You are the final decision maker for an AI hedge fund.
+Make trading decisions based on analysis and proposals.
+Always respond with valid JSON only, no other text."""
+
+DECIDE_USER = """{context}
 
 ANALYSIS:
 {analysis}
@@ -247,73 +267,82 @@ PROPOSAL:
 {proposal}
 
 Make the final trading decision.
-
 Rules:
 - Only BUY if you have cash and strong conviction
 - Only SELL if you have a position to sell
 - HOLD is always valid
 - target_weight is the desired portfolio weight (0.0 to 0.2)
 
-{format_instructions}""")
-])
+Respond with this exact JSON format:
+{{
+    "action": "buy|sell|hold",
+    "symbol": "TICKER" or null,
+    "target_weight": 0.10 or null,
+    "reasoning": "Brief explanation",
+    "confidence": 0.75
+}}
+
+Respond with JSON only."""
 
 
 class DecideChain:
-    """
-    Phase 3: Final decision using GPT with structured output.
-    
-    Uses Pydantic output parsing for validated decisions.
-    """
+    """Phase 3: Final decision."""
     
     def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
-        self.parser = PydanticOutputParser(pydantic_object=TradingDecisionOutput)
         self._llm = None
     
     def _get_llm(self):
         if self._llm is None:
-            self._llm = get_openai_llm(self.model, temperature=0.5)
+            self._llm = get_llm_for_model(self.model, temperature=0.5)
         return self._llm
     
     async def ainvoke(self, inputs: Dict[str, Any]) -> TradingDecisionOutput:
         """Run decision chain asynchronously."""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
         llm = self._get_llm()
+        context = inputs.get("context", "")
+        analysis = inputs.get("analysis", "")
+        proposal = inputs.get("proposal", "")
         
-        prompt = DECIDE_PROMPT.format_messages(
-            context=inputs.get("context", ""),
-            analysis=inputs.get("analysis", ""),
-            proposal=inputs.get("proposal", ""),
-            format_instructions=self.parser.get_format_instructions(),
+        messages = [
+            SystemMessage(content=DECIDE_SYSTEM),
+            HumanMessage(content=DECIDE_USER.format(
+                context=context,
+                analysis=analysis,
+                proposal=proposal
+            )),
+        ]
+        
+        response = await llm.ainvoke(messages)
+        
+        data = extract_json(response.content)
+        if data:
+            try:
+                return TradingDecisionOutput(**data)
+            except Exception as e:
+                logger.warning(f"Failed to create TradingDecisionOutput: {e}")
+        
+        # Fallback
+        return TradingDecisionOutput(
+            action="hold",
+            symbol=None,
+            target_weight=None,
+            reasoning="Decision parsing failed",
+            confidence=0.0
         )
-        
-        response = await llm.ainvoke(prompt)
-        
-        try:
-            return self.parser.parse(response.content)
-        except Exception as e:
-            logger.warning(f"Failed to parse decision: {e}")
-            return TradingDecisionOutput(
-                action="hold",
-                symbol=None,
-                target_weight=None,
-                reasoning="Decision parsing failed",
-                confidence=0.0
-            )
-    
-    def invoke(self, inputs: Dict[str, Any]) -> TradingDecisionOutput:
-        """Run decision chain synchronously."""
-        import asyncio
-        return asyncio.run(self.ainvoke(inputs))
 
 
 # ============================================================================
 # Phase 4: CONFIRM Chain (Claude for major trades)
 # ============================================================================
 
-CONFIRM_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a risk manager reviewing major trades.
-Only approve trades that pass risk criteria."""),
-    ("human", """{context}
+CONFIRM_SYSTEM = """You are a risk manager reviewing major trades.
+Only approve trades that pass risk criteria.
+Always respond with valid JSON only, no other text."""
+
+CONFIRM_USER = """{context}
 
 PROPOSED TRADE:
 Action: {action}
@@ -322,77 +351,77 @@ Target Weight: {target_weight}
 Reasoning: {reasoning}
 Confidence: {confidence}
 
-This is a major trade (>{threshold}% of portfolio).
-
+This is a major trade (>5% of portfolio).
 Should this trade be APPROVED or REJECTED?
 
-{format_instructions}""")
-])
+Respond with this exact JSON format:
+{{
+    "approved": true or false,
+    "reason": "Why approved or rejected",
+    "risk_score": 0.5
+}}
+
+Respond with JSON only."""
 
 
 class ConfirmChain:
-    """
-    Phase 4: Risk confirmation using Claude for major trades.
-    
-    Reviews large positions (>5% of portfolio) before execution.
-    """
+    """Phase 4: Risk confirmation for major trades."""
     
     MAJOR_TRADE_THRESHOLD = 0.05
     
     def __init__(self, model: str = "claude-3-haiku-20240307"):
         self.model = model
-        self.parser = PydanticOutputParser(pydantic_object=RiskConfirmation)
         self._llm = None
     
     def _get_llm(self):
         if self._llm is None:
             try:
-                self._llm = get_anthropic_llm(self.model)
+                self._llm = get_llm_for_model(self.model)
             except ValueError:
-                logger.warning("Anthropic not available, auto-approving")
+                logger.warning(f"Model {self.model} not available")
                 return None
         return self._llm
     
     async def ainvoke(self, inputs: Dict[str, Any]) -> RiskConfirmation:
         """Run confirmation chain asynchronously."""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
         llm = self._get_llm()
         
         if llm is None:
-            # Auto-approve if Claude not available
             return RiskConfirmation(
                 approved=True,
-                reason="Auto-approved (Claude not available)",
+                reason="Auto-approved (model not available)",
                 risk_score=0.5
             )
         
-        prompt = CONFIRM_PROMPT.format_messages(
-            context=inputs.get("context", ""),
-            action=inputs.get("action", ""),
-            symbol=inputs.get("symbol", ""),
-            target_weight=inputs.get("target_weight", 0),
-            reasoning=inputs.get("reasoning", ""),
-            confidence=inputs.get("confidence", 0),
-            threshold=self.MAJOR_TRADE_THRESHOLD * 100,
-            format_instructions=self.parser.get_format_instructions(),
+        messages = [
+            SystemMessage(content=CONFIRM_SYSTEM),
+            HumanMessage(content=CONFIRM_USER.format(
+                context=inputs.get("context", ""),
+                action=inputs.get("action", ""),
+                symbol=inputs.get("symbol", ""),
+                target_weight=inputs.get("target_weight", 0),
+                reasoning=inputs.get("reasoning", ""),
+                confidence=inputs.get("confidence", 0),
+            )),
+        ]
+        
+        response = await llm.ainvoke(messages)
+        
+        data = extract_json(response.content)
+        if data:
+            try:
+                return RiskConfirmation(**data)
+            except Exception as e:
+                logger.warning(f"Failed to create RiskConfirmation: {e}")
+        
+        # Default to approved on parse error
+        return RiskConfirmation(
+            approved=True,
+            reason="Parse error, defaulting to approved",
+            risk_score=0.5
         )
-        
-        response = await llm.ainvoke(prompt)
-        
-        try:
-            return self.parser.parse(response.content)
-        except Exception as e:
-            logger.warning(f"Failed to parse confirmation: {e}")
-            # Default to approved on parse error
-            return RiskConfirmation(
-                approved=True,
-                reason="Parse error, defaulting to approved",
-                risk_score=0.5
-            )
-    
-    def invoke(self, inputs: Dict[str, Any]) -> RiskConfirmation:
-        """Run confirmation chain synchronously."""
-        import asyncio
-        return asyncio.run(self.ainvoke(inputs))
 
 
 # ============================================================================
@@ -400,15 +429,11 @@ class ConfirmChain:
 # ============================================================================
 
 class DebateSequence:
-    """
-    Orchestrates the full 4-phase debate sequence.
-    
-    Runs: ANALYZE → PROPOSE → DECIDE → (optional) CONFIRM
-    """
+    """Orchestrates the full 4-phase debate sequence."""
     
     def __init__(
         self,
-        analyze_model: str = "gemini-1.5-flash",
+        analyze_model: str = "gpt-4o-mini",
         propose_model: str = "gpt-4o-mini",
         decide_model: str = "gpt-4o-mini",
         confirm_model: str = "claude-3-haiku-20240307",
@@ -423,20 +448,8 @@ class DebateSequence:
         context: str,
         require_confirmation_threshold: float = 0.05,
     ) -> Dict[str, Any]:
-        """
-        Run the full debate sequence asynchronously.
-        
-        Args:
-            context: Market and portfolio context string
-            require_confirmation_threshold: Weight threshold for Claude review
-            
-        Returns:
-            Dict with analysis, proposal, decision, and optional confirmation
-        """
-        result = {
-            "phases": [],
-            "tokens_used": 0,
-        }
+        """Run the full debate sequence asynchronously."""
+        result = {"phases": [], "tokens_used": 0}
         
         # Phase 1: ANALYZE
         analysis = await self.analyze_chain.ainvoke({"context": context})
@@ -492,7 +505,6 @@ class DebateSequence:
                 "output": confirmation.model_dump(),
             })
             
-            # Update decision if rejected
             if not confirmation.approved:
                 result["decision"] = TradingDecisionOutput(
                     action="hold",
@@ -503,12 +515,3 @@ class DebateSequence:
                 )
         
         return result
-    
-    def invoke(
-        self,
-        context: str,
-        require_confirmation_threshold: float = 0.05,
-    ) -> Dict[str, Any]:
-        """Run debate sequence synchronously."""
-        import asyncio
-        return asyncio.run(self.ainvoke(context, require_confirmation_threshold))

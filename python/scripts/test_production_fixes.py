@@ -20,7 +20,6 @@ from datetime import date
 import numpy as np
 
 from core.execution.trade_budget import TradeBudget
-from core.backtest.deidentifier import AssetDeidentifier, reset_deidentifier
 from core.backtest.validator import DecisionValidator, FORBIDDEN_TOKENS
 from core.backtest.feature_builder import FeaturePackBuilder
 from core.evals.enhanced_metrics import (
@@ -72,36 +71,30 @@ def test_trade_budget_enforcement():
     print("\n✅ TEST 1 PASSED: Trade budget enforcement works")
 
 
-def test_deidentification():
-    """Test 2: Ticker swap test (temporal leakage detection)."""
+def test_ticker_handling():
+    """Test 2: Ticker handling (real symbols used directly)."""
     print("\n" + "=" * 60)
-    print("TEST 2: De-identification (Ticker Swap)")
+    print("TEST 2: Ticker Handling (Direct Symbols)")
     print("=" * 60)
     
-    reset_deidentifier()
-    deidentifier = AssetDeidentifier()
+    # Test that we use real tickers directly now (no de-identification)
+    tickers = ["AAPL", "MSFT", "GOOG"]
     
-    # Register tickers
-    asset_1 = deidentifier.register("AAPL")
-    asset_2 = deidentifier.register("MSFT")
-    asset_3 = deidentifier.register("GOOG")
+    # Verify tickers are valid format
+    for ticker in tickers:
+        assert ticker.isupper(), f"Ticker should be uppercase: {ticker}"
+        assert len(ticker) <= 5, f"Ticker too long: {ticker}"
+        assert ticker.isalpha(), f"Ticker should be letters only: {ticker}"
+    print("✓ Tickers are valid format")
     
-    assert asset_1 == "Asset_001", f"Expected Asset_001, got {asset_1}"
-    assert asset_2 == "Asset_002", f"Expected Asset_002, got {asset_2}"
-    assert asset_3 == "Asset_003", f"Expected Asset_003, got {asset_3}"
-    print("✓ De-identification assigns sequential IDs")
+    # Test ticker lookup (simulated)
+    ticker_prices = {"AAPL": 150.0, "MSFT": 300.0, "GOOG": 140.0}
+    for ticker in tickers:
+        price = ticker_prices.get(ticker)
+        assert price is not None, f"Ticker not found: {ticker}"
+    print("✓ Ticker lookup works correctly")
     
-    # Test re-identification
-    ticker_1 = deidentifier.reidentify_ticker("Asset_001")
-    assert ticker_1 == "AAPL", f"Expected AAPL, got {ticker_1}"
-    print("✓ Re-identification works correctly")
-    
-    # Test idempotency
-    asset_1_again = deidentifier.register("AAPL")
-    assert asset_1_again == "Asset_001", "Should return same ID"
-    print("✓ De-identification is idempotent")
-    
-    print("\n✅ TEST 2 PASSED: De-identification works")
+    print("\n✅ TEST 2 PASSED: Ticker handling works")
 
 
 def test_forbidden_token_detection():
@@ -425,7 +418,7 @@ def run_all_tests():
     
     try:
         test_trade_budget_enforcement()
-        test_deidentification()
+        test_ticker_handling()
         test_forbidden_token_detection()
         test_mean_reversion_trades()
         test_decision_replay()

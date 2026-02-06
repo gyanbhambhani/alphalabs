@@ -17,6 +17,8 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { DebateViewer, DecisionList } from '@/components/DebateViewer';
+import { DecisionQueue } from '@/components/DecisionQueue';
+import { EnhancedDecisionViewer } from '@/components/EnhancedDecisionViewer';
 import { api } from '@/lib/api';
 import type { 
   FundDetail, 
@@ -229,11 +231,14 @@ export default function FundDetailPage() {
 
       {/* Selected Decision Detail */}
       {selectedDecision && (
-        <DebateViewer
-          decision={selectedDecision}
-          transcript={selectedTranscript || undefined}
-          onClose={handleCloseDecision}
-        />
+        <div className="my-6">
+          <EnhancedDecisionViewer
+            decision={selectedDecision}
+            transcript={selectedTranscript || undefined}
+            onClose={handleCloseDecision}
+            isStreaming={false}
+          />
+        </div>
       )}
 
       {/* Main Content */}
@@ -304,64 +309,13 @@ export default function FundDetailPage() {
 
         {/* Decisions Tab */}
         <TabsContent value="decisions" className="mt-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Decision History</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {decisions.length > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Time</TableHead>
-                      <TableHead>Type</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead>Details</TableHead>
-                      <TableHead>Inputs Hash</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {decisions.map(decision => (
-                      <TableRow 
-                        key={decision.decisionId}
-                        className={cn(
-                          "cursor-pointer hover:bg-muted/50",
-                          selectedDecisionId === decision.decisionId && "bg-muted"
-                        )}
-                        onClick={() => handleDecisionClick(decision.decisionId)}
-                      >
-                        <TableCell className="font-mono text-sm">
-                          {new Date(decision.asofTimestamp).toLocaleString()}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant={decision.decisionType === 'trade' ? 'default' : 'secondary'}>
-                            {decision.decisionType}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline">{decision.status}</Badge>
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          {decision.noTradeReason || 
-                            (decision.predictedDirections 
-                              ? `${Object.keys(decision.predictedDirections).length} positions`
-                              : '-'
-                            )}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs text-muted-foreground">
-                          {decision.inputsHash || '-'}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              ) : (
-                <p className="text-center text-muted-foreground py-8">
-                  No decisions yet. Run a trading cycle to generate decisions.
-                </p>
-              )}
-            </CardContent>
-          </Card>
+          <DecisionQueue
+            decisions={decisions}
+            isLoading={false}
+            onDecisionClick={handleDecisionClick}
+            showFilters={true}
+            enableStreaming={false}
+          />
         </TabsContent>
 
         {/* Config Tab */}

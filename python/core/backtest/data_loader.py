@@ -26,8 +26,8 @@ try:
 except ImportError:
     CHROMA_AVAILABLE = False
 
-# Universe of ~50 liquid stocks that existed throughout 2000-2025
-BACKTEST_UNIVERSE = [
+# Legacy small universe (for quick testing)
+LEGACY_UNIVERSE = [
     # Tech
     "AAPL", "MSFT", "INTC", "CSCO", "ORCL", "IBM",
     # Finance
@@ -43,6 +43,39 @@ BACKTEST_UNIVERSE = [
     # Benchmark
     "SPY",
 ]
+
+
+def load_sp500_universe() -> List[str]:
+    """
+    Load S&P 500 symbols from the CSV file.
+    Falls back to legacy universe if file not found.
+    """
+    # Try multiple possible paths
+    possible_paths = [
+        Path(__file__).parent.parent.parent / "data" / "sp500_list.csv",
+        Path("data/sp500_list.csv"),
+        Path("python/data/sp500_list.csv"),
+    ]
+    
+    for csv_path in possible_paths:
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                symbols = df['symbol'].tolist()
+                # Always include SPY for benchmark
+                if 'SPY' not in symbols:
+                    symbols.append('SPY')
+                logger.info(f"Loaded {len(symbols)} S&P 500 symbols from {csv_path}")
+                return symbols
+            except Exception as e:
+                logger.warning(f"Error loading S&P 500 list from {csv_path}: {e}")
+    
+    logger.warning("S&P 500 list not found, using legacy universe")
+    return LEGACY_UNIVERSE
+
+
+# Default universe - full S&P 500
+BACKTEST_UNIVERSE = load_sp500_universe()
 
 
 @dataclass
@@ -181,35 +214,128 @@ class HistoricalDataLoader:
             logger.error(f"Error fetching {symbol}: {e}")
             return None
     
-    def fetch_and_cache_all(self, force_refresh: bool = False) -> Dict[str, int]:
+    def _fetch_batch_from_yfinance(
+        self, 
+        symbols: List[str], 
+        batch_size: int = 50
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch multiple symbols in batches using yfinance's batch download.
+        Much faster than fetching one at a time.
+        """
+        results = {}
+        
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            batch_str = " ".join(batch)
+            
+            print(f"  Fetching batch {i//batch_size + 1}: {len(batch)} symbols...")
+            
+            try:
+                # Use yfinance download for batch fetching
+                df = yf.download(
+                    batch_str,
+                    start=self.start_date.isoformat(),
+                    end=self.end_date.isoformat(),
+                    progress=False,
+                    threads=True,
+                )
+                
+                if df.empty:
+                    continue
+                
+                # Handle single vs multi-symbol response
+                if len(batch) == 1:
+                    # Single symbol - df has simple columns
+                    symbol = batch[0]
+                    df.columns = df.columns.str.lower()
+                    if 'close' in df.columns:
+                        df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+                        df = df.dropna()
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                        results[symbol] = df
+                else:
+                    # Multi-symbol - df has MultiIndex columns (Price, Symbol)
+                    for symbol in batch:
+                        try:
+                            if symbol in df.columns.get_level_values(1):
+                                sym_df = df.xs(symbol, level=1, axis=1).copy()
+                                sym_df.columns = sym_df.columns.str.lower()
+                                if 'close' in sym_df.columns:
+                                    sym_df = sym_df[
+                                        ['open', 'high', 'low', 'close', 'volume']
+                                    ].copy()
+                                    sym_df = sym_df.dropna()
+                                    sym_df.index = pd.to_datetime(
+                                        sym_df.index
+                                    ).tz_localize(None)
+                                    if len(sym_df) > 100:  # Min 100 days
+                                        results[symbol] = sym_df
+                        except Exception as e:
+                            logger.debug(f"Error extracting {symbol}: {e}")
+                            
+            except Exception as e:
+                logger.error(f"Batch fetch error: {e}")
+        
+        return results
+    
+    def fetch_and_cache_all(
+        self, 
+        force_refresh: bool = False,
+        use_batch: bool = True,
+    ) -> Dict[str, int]:
         """
         Fetch all symbols and cache to disk.
         
         Args:
             force_refresh: If True, re-fetch even if cached
+            use_batch: If True, use batch downloading (much faster)
             
         Returns:
             Dict of symbol -> number of trading days fetched
         """
         results = {}
+        symbols_to_fetch = []
         
+        # Check cache first
         for symbol in self.universe:
             if not force_refresh and self._is_cached(symbol):
                 df = self._load_from_cache(symbol)
                 if df is not None:
                     results[symbol] = len(df)
-                    logger.info(f"{symbol}: loaded from cache ({len(df)} days)")
                     continue
-            
-            logger.info(f"Fetching {symbol} from yfinance...")
-            df = self._fetch_from_yfinance(symbol)
-            
-            if df is not None and not df.empty:
-                self._save_to_cache(symbol, df)
-                results[symbol] = len(df)
-                logger.info(f"{symbol}: fetched {len(df)} days")
-            else:
-                logger.warning(f"{symbol}: fetch failed")
+            symbols_to_fetch.append(symbol)
+        
+        if not symbols_to_fetch:
+            print(f"All {len(results)} symbols loaded from cache")
+            return results
+        
+        print(f"Fetching {len(symbols_to_fetch)} symbols...")
+        
+        if use_batch:
+            # Batch fetch (much faster)
+            batch_results = self._fetch_batch_from_yfinance(symbols_to_fetch)
+            for symbol, df in batch_results.items():
+                if df is not None and not df.empty:
+                    self._save_to_cache(symbol, df)
+                    results[symbol] = len(df)
+                    
+            # Report results
+            fetched = len(batch_results)
+            failed = len(symbols_to_fetch) - fetched
+            print(f"  Fetched: {fetched}, Failed: {failed}")
+        else:
+            # One-by-one fetch (slower but more reliable)
+            for symbol in symbols_to_fetch:
+                logger.info(f"Fetching {symbol} from yfinance...")
+                df = self._fetch_from_yfinance(symbol)
+                
+                if df is not None and not df.empty:
+                    self._save_to_cache(symbol, df)
+                    results[symbol] = len(df)
+                    logger.info(f"{symbol}: fetched {len(df)} days")
+                else:
+                    logger.warning(f"{symbol}: fetch failed")
         
         return results
     

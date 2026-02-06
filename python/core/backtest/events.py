@@ -112,6 +112,8 @@ class DecisionEvent(BacktestEvent):
     reasoning: str = ""
     confidence: float = 0.0
     signals_used: Dict[str, float] = field(default_factory=dict)
+    status: str = "finalized"  # Decision status for frontend pipeline
+    decision_id: Optional[str] = None  # Unique ID for tracking
     
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
@@ -133,6 +135,7 @@ class TradeExecutedEvent(BacktestEvent):
     commission: float = 0.0
     total_cost: float = 0.0
     reasoning: str = ""
+    decision_id: Optional[str] = None  # Links back to the decision
     
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()

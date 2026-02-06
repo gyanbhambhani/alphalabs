@@ -37,6 +37,29 @@ class BacktestPosition:
         if self.cost_basis == 0:
             return 0.0
         return self.unrealized_pnl / self.cost_basis
+    
+    def days_held(self, current_date: date) -> int:
+        """Calculate how many days this position has been held."""
+        if self.opened_at is None:
+            return 0
+        return (current_date - self.opened_at).days
+    
+    def can_sell(self, current_date: date, min_hold_days: int = 3) -> bool:
+        """
+        Check if position can be sold based on holding period and loss.
+        
+        Rules:
+        - Must hold for at least min_hold_days (default 3)
+        - OR loss exceeds 15% (stop-loss override)
+        """
+        days = self.days_held(current_date)
+        
+        # Stop-loss override: can always sell if losing >15%
+        if self.unrealized_return < -0.15:
+            return True
+        
+        # Otherwise, must meet minimum holding period
+        return days >= min_hold_days
 
 
 @dataclass
