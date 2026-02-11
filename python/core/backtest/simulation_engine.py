@@ -122,6 +122,7 @@ class SimulationEngine:
     # Commission model
     COMMISSION_PER_SHARE = 0.01
     MIN_COMMISSION_PCT = 0.001  # 0.1%
+    SPREAD_COST_PCT = 0.001     # 0.1% half-spread (conservative for S&P 500)
     
     def __init__(
         self,
@@ -151,7 +152,12 @@ class SimulationEngine:
         self.data_loader = data_loader
         self.snapshot_builder = PointInTimeSnapshotBuilder(data_loader)
         self.debate_version = debate_version
-        self.debate_runner = get_debate_runner(version=debate_version)
+        # Disable ExperienceStore during backtest to prevent in-sample bias
+        # (learning from future outcomes that wouldn't be available in real trading)
+        self.debate_runner = get_debate_runner(
+            version=debate_version,
+            disable_experience_store=True,
+        )
         self.persistence = persistence
         
         # Date range - default to 2001-01-02 to ensure 1 year of historical data
@@ -230,6 +236,10 @@ class SimulationEngine:
         
         # Track last trade date per fund per symbol (for churn prevention)
         self._last_trade_date: Dict[str, Dict[str, date]] = {}
+        
+        # T+1 Execution: Pending decisions made on Day T, execute at Day T+1 open
+        # Each entry: (fund, decision, decision_date, snapshot_at_decision)
+        self._pending_decisions: List[Tuple[FundConfig, TradingDecision, date, GlobalMarketSnapshot]] = []
     
     @property
     def progress(self) -> float:
@@ -680,6 +690,17 @@ class SimulationEngine:
                 # Process this trading day
                 await self._process_day(current_date, day_idx)
                 
+                # Update progress in persistence
+                if self.persistence:
+                    try:
+                        self.persistence.update_run_progress(
+                            self.run_id,
+                            current_day=day_idx + 1,
+                            total_days=len(self.trading_days),
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to update progress: {e}")
+                
                 # Time dilation delay
                 delay = 1.0 / self.speed
                 if delay > 0.001:  # Skip tiny delays
@@ -775,8 +796,30 @@ class SimulationEngine:
             raise
     
     async def _process_day(self, current_date: date, day_idx: int) -> None:
-        """Process a single trading day."""
-        # Build point-in-time snapshot (NO FUTURE DATA)
+        """
+        Process a single trading day with T+1 execution model.
+        
+        T+1 Execution Flow:
+        1. Execute PENDING decisions from yesterday at TODAY's open price
+        2. Build snapshot with today's CLOSE prices (for signals)
+        3. Run debates, store decisions as PENDING (execute tomorrow)
+        
+        This eliminates lookahead bias - we can't use close price for both
+        signal generation AND execution on the same day.
+        """
+        # =====================================================================
+        # STEP 1: Execute pending decisions from yesterday at TODAY's OPEN
+        # =====================================================================
+        if self._pending_decisions:
+            exec_log(
+                f"Executing {len(self._pending_decisions)} pending decisions "
+                f"at {current_date} open"
+            )
+            await self._execute_pending_decisions(current_date)
+        
+        # =====================================================================
+        # STEP 2: Build snapshot with today's CLOSE prices (for signals)
+        # =====================================================================
         snapshot = self.snapshot_builder.build_snapshot(current_date)
         
         # Get benchmark value (SPY)
@@ -786,7 +829,9 @@ class SimulationEngine:
         
         benchmark_return = 0.0
         if self.benchmark_start_value and spy_price:
-            benchmark_return = (spy_price - self.benchmark_start_value) / self.benchmark_start_value
+            benchmark_return = (
+                spy_price - self.benchmark_start_value
+            ) / self.benchmark_start_value
         
         # Emit day tick
         await self.emit_event(DayTickEvent(
@@ -800,16 +845,17 @@ class SimulationEngine:
             prices=dict(list(snapshot.prices.items())[:20]),  # Top 20 for SSE
         ))
         
-        # Update all portfolio prices first
+        # Update all portfolio prices (using close prices for valuation)
         for fund in self.funds:
             portfolio = self.portfolios[fund.fund_id]
             portfolio.update_prices(snapshot.prices)
         
-        # Run funds SEQUENTIALLY (not parallel) for better visualization
-        # Each fund gets its turn, with a pause between for readability
+        # =====================================================================
+        # STEP 3: Run debates, store decisions as PENDING (execute tomorrow)
+        # =====================================================================
         results = []
         for fund in self.funds:
-            result = await self._run_fund_day(fund, snapshot, current_date)
+            result = await self._run_fund_day_no_execute(fund, snapshot, current_date)
             results.append(result)
             
             # Small delay between funds for readability (scaled by speed)
@@ -1019,6 +1065,404 @@ class SimulationEngine:
             new_positions=new_positions,
         )
     
+    async def _run_fund_day_no_execute(
+        self,
+        fund: FundConfig,
+        snapshot: GlobalMarketSnapshot,
+        current_date: date,
+    ) -> FundDayResult:
+        """
+        Run a fund's trading day but QUEUE decisions instead of executing.
+        
+        This is the T+1 version - decisions made today execute tomorrow.
+        """
+        portfolio = self.portfolios[fund.fund_id]
+        
+        # Get/create trade budget BEFORE debate
+        budget = self._get_or_create_budget(
+            fund.fund_id,
+            current_date,
+            fund.thesis,
+        )
+        
+        # Emit debate start
+        await self.emit_event(DebateStartEvent(
+            timestamp=datetime.utcnow(),
+            fund_id=fund.fund_id,
+            fund_name=fund.name,
+            simulation_date=current_date,
+        ))
+        
+        # Run AI debate with budget constraints
+        decision = await self.debate_runner.run_debate(
+            fund_id=fund.fund_id,
+            fund_name=fund.name,
+            fund_thesis=fund.thesis,
+            portfolio=portfolio,
+            snapshot=snapshot,
+            simulation_date=current_date,
+            trade_budget=budget,
+        )
+        
+        # Emit debate messages
+        for msg in decision.debate_transcript:
+            await self.emit_event(DebateMessageEvent(
+                timestamp=msg.timestamp,
+                fund_id=fund.fund_id,
+                phase=msg.phase,
+                model=msg.model,
+                content=msg.content,
+                tokens_used=msg.tokens_used,
+            ))
+        
+        # Generate decision ID for tracking
+        decision_id = f"{self.run_id}_{fund.fund_id}_{current_date.isoformat()}"
+        
+        # Status: pending_execution for buy/sell (will execute tomorrow)
+        status = "finalized" if decision.action == "hold" else "pending_execution"
+        
+        # Emit decision
+        await self.emit_event(DecisionEvent(
+            timestamp=datetime.utcnow(),
+            fund_id=fund.fund_id,
+            fund_name=fund.name,
+            simulation_date=current_date,
+            action=decision.action,
+            symbol=decision.symbol,
+            target_weight=decision.target_weight,
+            reasoning=decision.reasoning,
+            confidence=decision.confidence,
+            signals_used=decision.signals_used,
+            status=status,
+            decision_id=decision_id,
+        ))
+        
+        # Save decision to persistence
+        self._total_decisions += 1
+        if self.persistence:
+            try:
+                self.persistence.save_decision(
+                    run_id=self.run_id,
+                    fund_id=fund.fund_id,
+                    decision_date=current_date,
+                    action=decision.action,
+                    symbol=decision.symbol,
+                    target_weight=decision.target_weight,
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                    debate_transcript=[
+                        {
+                            "phase": msg.phase,
+                            "model": msg.model,
+                            "content": msg.content,
+                            "tokens": msg.tokens_used,
+                            "timestamp": msg.timestamp.isoformat(),
+                        }
+                        for msg in decision.debate_transcript
+                    ] if decision.debate_transcript else None,
+                    signals_snapshot=decision.signals_used,
+                    models_used=decision.models_used,
+                    tokens_used=decision.total_tokens,
+                )
+            except Exception as e:
+                logger.error(f"Failed to save decision: {e}")
+        
+        # QUEUE decision for T+1 execution (instead of executing now)
+        if decision.action != "hold" and decision.symbol:
+            # Validate against budget
+            if decision.action == "buy" and not budget.can_buy():
+                logger.warning(
+                    f"[{fund.fund_id}] Buy decision rejected by budget gate"
+                )
+            else:
+                # Queue for tomorrow's execution
+                self._pending_decisions.append(
+                    (fund, decision, current_date, snapshot)
+                )
+                exec_log(
+                    f"[{fund.fund_id}] Queued {decision.action} {decision.symbol} "
+                    f"for T+1 execution"
+                )
+                
+                # Consume budget now (decision made, execution tomorrow)
+                if decision.action == "buy":
+                    budget.consume_trade_event()
+        
+        return FundDayResult(
+            fund_id=fund.fund_id,
+            decision=decision,
+            trades=[],  # No trades yet - will execute tomorrow
+            new_positions=0,
+        )
+    
+    async def _execute_pending_decisions(
+        self,
+        execution_date: date,
+    ) -> List[BacktestTrade]:
+        """
+        Execute pending decisions from previous day at today's OPEN price.
+        
+        This implements T+1 execution:
+        - Decisions made on Day T (using close prices for signals)
+        - Executed on Day T+1 at open price
+        
+        This eliminates lookahead bias where we'd otherwise be using
+        the close price for both signal AND execution.
+        """
+        executed_trades = []
+        
+        for fund, decision, decision_date, decision_snapshot in self._pending_decisions:
+            if decision.action == "hold" or not decision.symbol:
+                continue
+            
+            portfolio = self.portfolios[fund.fund_id]
+            
+            # Get OPEN price for execution (not close!)
+            open_price = self.data_loader.get_open_price_asof(
+                decision.symbol, execution_date
+            )
+            
+            if open_price is None:
+                logger.warning(
+                    f"[{fund.fund_id}] Cannot execute {decision.action} {decision.symbol}: "
+                    f"no open price for {execution_date}"
+                )
+                continue
+            
+            # Apply spread cost - worse execution price
+            if decision.action == "buy":
+                effective_price = open_price * (1 + self.SPREAD_COST_PCT)
+            else:  # sell
+                effective_price = open_price * (1 - self.SPREAD_COST_PCT)
+            
+            # Execute at the effective price (open + spread)
+            trade = await self._execute_decision_at_price(
+                fund=fund,
+                portfolio=portfolio,
+                decision=decision,
+                execution_price=effective_price,
+                execution_date=execution_date,
+                decision_date=decision_date,
+            )
+            
+            if trade:
+                executed_trades.append(trade)
+                trade_log(
+                    f"T+1 EXEC: {decision.action.upper()} {decision.symbol} "
+                    f"decided {decision_date}, executed {execution_date} "
+                    f"@ open ${open_price:.2f} (eff: ${effective_price:.2f})"
+                )
+        
+        # Clear pending decisions
+        self._pending_decisions = []
+        
+        return executed_trades
+    
+    async def _execute_decision_at_price(
+        self,
+        fund: FundConfig,
+        portfolio: BacktestPortfolio,
+        decision: TradingDecision,
+        execution_price: float,
+        execution_date: date,
+        decision_date: date,
+    ) -> Optional[BacktestTrade]:
+        """
+        Execute a decision at a specific price (for T+1 execution).
+        
+        Similar to _execute_decision but uses provided price instead of snapshot.
+        """
+        if not decision.symbol or execution_price <= 0:
+            return None
+        
+        target_weight = decision.target_weight or 0.1
+        budget = self.trade_budgets.get(fund.fund_id)
+        
+        try:
+            if decision.action == "buy":
+                # Calculate quantity from target weight
+                target_value = portfolio.total_value * target_weight
+                current_weight = portfolio.get_position_weight(decision.symbol)
+                current_value = portfolio.total_value * current_weight
+                buy_value = target_value - current_value
+                quantity = int(buy_value / execution_price)
+                
+                if quantity <= 0:
+                    return None
+                
+                # Calculate commission + spread is already in effective_price
+                commission = max(
+                    quantity * self.COMMISSION_PER_SHARE,
+                    quantity * execution_price * self.MIN_COMMISSION_PCT
+                )
+                
+                # Check if we have enough cash
+                total_cost = quantity * execution_price + commission
+                if total_cost > portfolio.cash:
+                    quantity = int((portfolio.cash - commission) / execution_price)
+                    if quantity <= 0:
+                        return None
+                    commission = max(
+                        quantity * self.COMMISSION_PER_SHARE,
+                        quantity * execution_price * self.MIN_COMMISSION_PCT
+                    )
+                
+                trade = portfolio.execute_buy(
+                    symbol=decision.symbol,
+                    quantity=quantity,
+                    price=execution_price,
+                    commission=commission,
+                    timestamp=datetime.combine(execution_date, datetime.min.time()),
+                    reasoning=f"T+1: {decision.reasoning}",
+                )
+                
+                # Track for persistence and metrics
+                self._total_trades += 1
+                self._trades_today[fund.fund_id] = (
+                    self._trades_today.get(fund.fund_id, 0) + 1
+                )
+                self._trade_values[fund.fund_id].append(quantity * execution_price)
+                
+                # Record for outcome tracking
+                decision_id = f"{self.run_id}_{fund.fund_id}_{decision_date.isoformat()}"
+                self.outcome_trackers[fund.fund_id].record_entry(
+                    decision_id=decision_id,
+                    fund_id=fund.fund_id,
+                    symbol=decision.symbol,
+                    direction="long",
+                    entry_price=execution_price,
+                    entry_weight=target_weight,
+                    predicted_direction="up",
+                    predicted_confidence=decision.confidence,
+                )
+                
+                # Save to persistence
+                if self.persistence:
+                    try:
+                        self.persistence.save_trade(
+                            run_id=self.run_id,
+                            fund_id=fund.fund_id,
+                            trade_date=execution_date,
+                            symbol=decision.symbol,
+                            side="buy",
+                            quantity=quantity,
+                            price=execution_price,
+                            commission=commission,
+                            reasoning=f"T+1: {decision.reasoning}",
+                            confidence=decision.confidence,
+                            signals_snapshot=decision.signals_used,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to save trade: {e}")
+                
+                # Emit trade event
+                await self.emit_event(TradeExecutedEvent(
+                    timestamp=datetime.utcnow(),
+                    fund_id=fund.fund_id,
+                    fund_name=fund.name,
+                    symbol=decision.symbol,
+                    side="buy",
+                    quantity=quantity,
+                    price=execution_price,
+                    commission=commission,
+                    total_cost=quantity * execution_price + commission,
+                    reasoning=f"T+1: {decision.reasoning}",
+                    decision_id=decision_id,
+                ))
+                
+                # Update budget
+                if budget:
+                    budget.record_trade()
+                
+                # Record for churn prevention
+                self._record_trade(fund.fund_id, decision.symbol, "buy", execution_date)
+                
+                return trade
+                
+            elif decision.action == "sell":
+                if decision.symbol not in portfolio.positions:
+                    return None
+                
+                pos = portfolio.positions[decision.symbol]
+                quantity = pos.quantity
+                
+                commission = max(
+                    quantity * self.COMMISSION_PER_SHARE,
+                    quantity * execution_price * self.MIN_COMMISSION_PCT
+                )
+                
+                trade = portfolio.execute_sell(
+                    symbol=decision.symbol,
+                    quantity=quantity,
+                    price=execution_price,
+                    commission=commission,
+                    timestamp=datetime.combine(execution_date, datetime.min.time()),
+                    reasoning=f"T+1: {decision.reasoning}",
+                )
+                
+                # Track
+                self._total_trades += 1
+                self._trades_today[fund.fund_id] = (
+                    self._trades_today.get(fund.fund_id, 0) + 1
+                )
+                self._trade_values[fund.fund_id].append(quantity * execution_price)
+                
+                # Record exit
+                decision_id = f"{self.run_id}_{fund.fund_id}_{decision_date.isoformat()}"
+                slippage_bps = commission / (quantity * execution_price) * 10000
+                self.outcome_trackers[fund.fund_id].record_exit(
+                    fund_id=fund.fund_id,
+                    symbol=decision.symbol,
+                    exit_price=execution_price,
+                    exit_reason=f"T+1: {decision.reasoning}",
+                    slippage_bps=slippage_bps,
+                )
+                
+                # Save to persistence
+                if self.persistence:
+                    try:
+                        self.persistence.save_trade(
+                            run_id=self.run_id,
+                            fund_id=fund.fund_id,
+                            trade_date=execution_date,
+                            symbol=decision.symbol,
+                            side="sell",
+                            quantity=quantity,
+                            price=execution_price,
+                            commission=commission,
+                            reasoning=f"T+1: {decision.reasoning}",
+                            confidence=decision.confidence,
+                            signals_snapshot=decision.signals_used,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to save trade: {e}")
+                
+                # Emit trade event
+                await self.emit_event(TradeExecutedEvent(
+                    timestamp=datetime.utcnow(),
+                    fund_id=fund.fund_id,
+                    fund_name=fund.name,
+                    symbol=decision.symbol,
+                    side="sell",
+                    quantity=quantity,
+                    price=execution_price,
+                    commission=commission,
+                    total_cost=quantity * execution_price - commission,
+                    reasoning=f"T+1: {decision.reasoning}",
+                    decision_id=decision_id,
+                ))
+                
+                # Record for churn prevention
+                self._record_trade(fund.fund_id, decision.symbol, "sell", execution_date)
+                
+                return trade
+                
+        except Exception as e:
+            logger.error(f"[{fund.fund_id}] T+1 execution failed: {e}")
+            return None
+        
+        return None
+    
     async def _execute_decision(
         self,
         fund: FundConfig,
@@ -1143,6 +1587,7 @@ class SimulationEngine:
                             commission=commission,
                             reasoning=decision.reasoning,
                             confidence=decision.confidence,
+                            signals_snapshot=decision.signals_used,
                         )
                     except Exception as e:
                         logger.error(f"Failed to save trade: {e}")
@@ -1256,6 +1701,7 @@ class SimulationEngine:
                             commission=commission,
                             reasoning=decision.reasoning,
                             confidence=decision.confidence,
+                            signals_snapshot=decision.signals_used,
                         )
                     except Exception as e:
                         logger.error(f"Failed to save trade: {e}")

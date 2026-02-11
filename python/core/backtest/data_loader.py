@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import yfinance as yf
 from dataclasses import dataclass
 import logging
@@ -74,8 +74,73 @@ def load_sp500_universe() -> List[str]:
     return LEGACY_UNIVERSE
 
 
+def load_sp500_universe_with_dates() -> List[Dict[str, Any]]:
+    """
+    Load S&P 500 symbols with their date_added for survivorship bias filtering.
+    
+    Returns list of dicts with 'symbol' and 'date_added' keys.
+    """
+    from datetime import datetime as dt
+    
+    possible_paths = [
+        Path(__file__).parent.parent.parent / "data" / "sp500_list.csv",
+        Path("data/sp500_list.csv"),
+        Path("python/data/sp500_list.csv"),
+    ]
+    
+    for csv_path in possible_paths:
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                universe_data = []
+                
+                for _, row in df.iterrows():
+                    symbol = row['symbol']
+                    date_added_str = row.get('date_added', '1957-03-04')  # Default to S&P inception
+                    
+                    # Parse date_added
+                    try:
+                        if pd.isna(date_added_str) or date_added_str == '':
+                            date_added = date(1957, 3, 4)  # S&P 500 inception
+                        else:
+                            date_added = dt.strptime(str(date_added_str), '%Y-%m-%d').date()
+                    except (ValueError, TypeError):
+                        date_added = date(1957, 3, 4)
+                    
+                    universe_data.append({
+                        'symbol': symbol,
+                        'date_added': date_added,
+                    })
+                
+                # Always include SPY (benchmark) - available since 1993
+                spy_exists = any(d['symbol'] == 'SPY' for d in universe_data)
+                if not spy_exists:
+                    universe_data.append({
+                        'symbol': 'SPY',
+                        'date_added': date(1993, 1, 22),  # SPY inception
+                    })
+                
+                logger.info(
+                    f"Loaded {len(universe_data)} S&P 500 symbols with dates from {csv_path}"
+                )
+                return universe_data
+                
+            except Exception as e:
+                logger.warning(f"Error loading S&P 500 list from {csv_path}: {e}")
+    
+    # Fallback: legacy universe with old dates
+    logger.warning("S&P 500 list not found, using legacy universe with default dates")
+    return [
+        {'symbol': s, 'date_added': date(1990, 1, 1)} 
+        for s in LEGACY_UNIVERSE
+    ]
+
+
 # Default universe - full S&P 500
 BACKTEST_UNIVERSE = load_sp500_universe()
+
+# Universe with dates for survivorship filtering
+BACKTEST_UNIVERSE_WITH_DATES = load_sp500_universe_with_dates()
 
 
 @dataclass
@@ -124,6 +189,7 @@ class HistoricalDataLoader:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         self.universe = universe or BACKTEST_UNIVERSE
+        self.universe_with_dates = BACKTEST_UNIVERSE_WITH_DATES
         self.start_date = start_date or self.DEFAULT_START
         self.end_date = end_date or self.DEFAULT_END
         
@@ -133,6 +199,12 @@ class HistoricalDataLoader:
         
         # Trading calendar (populated on first load)
         self._trading_days: Optional[pd.DatetimeIndex] = None
+        
+        # Build symbol -> date_added lookup for survivorship filtering
+        self._symbol_date_added: Dict[str, date] = {
+            d['symbol']: d['date_added'] 
+            for d in self.universe_with_dates
+        }
     
     @property
     def trading_days(self) -> pd.DatetimeIndex:
@@ -147,6 +219,28 @@ class HistoricalDataLoader:
                 first_sym = next(iter(self._data.keys()))
                 self._trading_days = self._data[first_sym].index
         return self._trading_days
+    
+    def get_universe_asof(self, asof_date: date) -> List[str]:
+        """
+        Get symbols that were in S&P 500 as of asof_date.
+        
+        This filters out survivorship bias by only including stocks
+        that had been added to the index by the given date.
+        
+        Args:
+            asof_date: The simulation date to filter universe for
+            
+        Returns:
+            List of symbols that were in the index as of asof_date
+        """
+        return [
+            symbol for symbol, date_added in self._symbol_date_added.items()
+            if date_added <= asof_date
+        ]
+    
+    def get_symbol_date_added(self, symbol: str) -> Optional[date]:
+        """Get the date a symbol was added to S&P 500."""
+        return self._symbol_date_added.get(symbol)
     
     def _cache_path(self, symbol: str) -> Path:
         """Get cache file path for a symbol."""
@@ -422,6 +516,44 @@ class HistoricalDataLoader:
             return None
         
         return float(df['close'].iloc[-1])
+    
+    def get_open_price_asof(
+        self,
+        symbol: str,
+        asof_date: date,
+    ) -> Optional[float]:
+        """
+        Get OPEN price for a symbol on asof_date.
+        
+        Used for T+1 execution: decision made on Day T close, executed at Day T+1 open.
+        
+        Args:
+            symbol: Stock symbol
+            asof_date: The date to get open price for
+            
+        Returns:
+            Open price for asof_date specifically, or None if not available
+        """
+        df = self.get_data_asof(symbol, asof_date)
+        if df is None or df.empty:
+            return None
+        
+        # Get the open price for asof_date specifically (not most recent)
+        # We need the actual open on this date, not a prior date's open
+        import pandas as pd
+        asof_dt = pd.Timestamp(asof_date)
+        
+        # Check if asof_date is in the data
+        if asof_dt in df.index:
+            return float(df.loc[asof_dt, 'open'])
+        
+        # If exact date not found, check by date component
+        date_mask = df.index.date == asof_date
+        if date_mask.any():
+            return float(df.loc[date_mask, 'open'].iloc[0])
+        
+        # asof_date is not a trading day - return None (can't execute)
+        return None
     
     def get_prices_asof(
         self,

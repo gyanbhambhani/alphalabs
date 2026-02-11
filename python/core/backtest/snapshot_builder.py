@@ -112,11 +112,19 @@ class PointInTimeSnapshotBuilder:
         """
         Get closing prices for all symbols as of asof_date.
         
+        Uses HISTORICAL universe filtering to avoid survivorship bias:
+        - Only includes stocks that were in S&P 500 by asof_date
+        - Uses date_added from sp500_list.csv
+        
         Uses the most recent available price if asof_date is not a trading day.
         """
         prices = {}
         
-        for symbol in self.universe:
+        # Use historical universe to avoid survivorship bias
+        # Only include stocks that had been added to S&P 500 by this date
+        historical_universe = self.loader.get_universe_asof(asof_date)
+        
+        for symbol in historical_universe:
             price = self.loader.get_price_asof(symbol, asof_date)
             if price is not None:
                 prices[symbol] = price

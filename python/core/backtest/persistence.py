@@ -827,16 +827,110 @@ class BacktestPersistence:
         
         return output.getvalue()
     
+    # =========================================================================
+    # JSON Formatting Utilities
+    # =========================================================================
+    
+    def _parse_json_field(self, value: Any) -> Any:
+        """
+        Parse a JSON string field, returning None for 'null' strings.
+        
+        Handles:
+        - None -> None
+        - "null" string -> None
+        - "{}" string -> {} dict
+        - Already parsed dict/list -> pass through
+        """
+        if value is None or value == "null":
+            return None
+        if isinstance(value, str):
+            if value == "null":
+                return None
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                return value
+        return value
+    
+    def _format_debate_transcript(
+        self, 
+        transcript: Any
+    ) -> Optional[List[Dict]]:
+        """
+        Clean and format debate transcript for readable JSON output.
+        
+        Parses nested JSON content strings into proper objects for cleaner output.
+        """
+        if transcript is None or transcript == "null":
+            return None
+        
+        if isinstance(transcript, str):
+            if transcript == "null":
+                return None
+            try:
+                transcript = json.loads(transcript)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        
+        if not transcript:
+            return None
+        
+        formatted = []
+        for msg in transcript:
+            # Parse the nested content JSON (LLM responses are often JSON strings)
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Keep as string if not valid JSON
+            
+            formatted.append({
+                "phase": msg.get("phase"),
+                "model": msg.get("model"),
+                "content": content,  # Now properly parsed
+                "timestamp": msg.get("timestamp"),
+            })
+        
+        return formatted
+    
     def export_run_json(self, run_id: str) -> Dict:
-        """Export complete run data as JSON."""
+        """
+        Export complete run data as JSON with formatted output.
+        
+        Parses all JSON string fields into proper objects for clean output.
+        """
         run = self.get_run(run_id)
         if not run:
             return {}
         
+        decisions = self.get_decisions_for_run(run_id)
+        trades = self.get_trades_for_run(run_id)
+        
+        # Format decisions - parse JSON fields and clean debate transcripts
+        for d in decisions:
+            d["debate_transcript"] = self._format_debate_transcript(
+                d.get("debate_transcript")
+            )
+            d["signals_snapshot"] = self._parse_json_field(d.get("signals_snapshot"))
+            d["models_used"] = self._parse_json_field(d.get("models_used"))
+        
+        # Format trades - parse signals_snapshot
+        for t in trades:
+            t["signals_snapshot"] = self._parse_json_field(t.get("signals_snapshot"))
+        
+        # Parse run config fields
+        if run.get("config"):
+            run["config"] = self._parse_json_field(run["config"])
+        if run.get("fund_ids"):
+            run["fund_ids"] = self._parse_json_field(run["fund_ids"])
+        if run.get("universe"):
+            run["universe"] = self._parse_json_field(run["universe"])
+        
         return {
             "run": run,
-            "trades": self.get_trades_for_run(run_id),
-            "decisions": self.get_decisions_for_run(run_id),
+            "trades": trades,
+            "decisions": decisions,
             "snapshots": self.get_snapshots_for_run(run_id),
         }
     
