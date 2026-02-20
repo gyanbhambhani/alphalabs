@@ -369,7 +369,7 @@ class ConfirmChain:
     
     MAJOR_TRADE_THRESHOLD = 0.05
     
-    def __init__(self, model: str = "claude-3-haiku-20240307"):
+    def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
         self._llm = None
     
@@ -436,7 +436,7 @@ class DebateSequence:
         analyze_model: str = "gpt-4o-mini",
         propose_model: str = "gpt-4o-mini",
         decide_model: str = "gpt-4o-mini",
-        confirm_model: str = "claude-3-haiku-20240307",
+        confirm_model: str = "gpt-4o-mini",
     ):
         self.analyze_chain = AnalyzeChain(model=analyze_model)
         self.propose_chain = ProposeChain(model=propose_model)

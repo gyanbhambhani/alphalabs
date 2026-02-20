@@ -149,7 +149,7 @@ class DailyDebateRunner:
         self,
         analyze_model: str = "gpt-4o-mini",
         propose_model: str = "gpt-4o-mini",
-        decide_model: str = "claude-3-haiku-20240307",
+        decide_model: str = "gpt-4o-mini",
     ):
         """
         Initialize debate runner with model configuration.
@@ -157,7 +157,7 @@ class DailyDebateRunner:
         Args:
             analyze_model: Model for market analysis (default: gpt-4o-mini)
             propose_model: Model for trade proposals (default: gpt-4o-mini)
-            decide_model: Model for final decision (default: claude-3-haiku)
+            decide_model: Model for final decision (default: gpt-4o-mini)
         """
         self._model_names = {
             "analyze": analyze_model,
@@ -852,7 +852,7 @@ class CollaborativeDebateRunner:
     def __init__(
         self,
         analyst_model: str = "gpt-4o-mini",
-        critic_model: str = "claude-3-haiku-20240307",
+        critic_model: str = "gpt-4o-mini",
         experience_db_path: str = "data/experience.db",
     ):
         """
