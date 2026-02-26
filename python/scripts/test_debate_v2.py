@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.backtest.debate_runner import (
     CollaborativeDebateRunner,
-    DailyDebateRunner,
     get_debate_runner,
 )
 from core.backtest.portfolio_tracker import BacktestPortfolio
@@ -152,8 +151,7 @@ async def test_debate_runner_v2():
     snapshot = create_test_snapshot()
     portfolio = create_test_portfolio()
     
-    # Get V2 runner
-    runner = get_debate_runner(version="v2")
+    runner = get_debate_runner(disable_experience_store=True)
     print(f"\nRunner type: {type(runner).__name__}")
     
     print("\nRunning debate (this will make LLM API calls)...")
@@ -190,44 +188,6 @@ async def test_debate_runner_v2():
         return False
 
 
-async def test_debate_runner_v1():
-    """Test the old DailyDebateRunner for comparison."""
-    print("\n" + "=" * 60)
-    print("TEST 4: DailyDebateRunner (V1) for comparison")
-    print("=" * 60)
-    
-    snapshot = create_test_snapshot()
-    portfolio = create_test_portfolio()
-    
-    # Get V1 runner
-    runner = get_debate_runner(version="v1")
-    print(f"\nRunner type: {type(runner).__name__}")
-    
-    print("\nRunning V1 debate for comparison...")
-    
-    try:
-        decision = await runner.run_debate(
-            fund_id="momentum_tech",
-            fund_name="Momentum Tech Fund",
-            fund_thesis="Buy stocks with strong 21-day momentum in tech sector",
-            portfolio=portfolio,
-            snapshot=snapshot,
-            simulation_date=date(2024, 1, 15),
-        )
-        
-        print(f"\n--- V1 DECISION ---")
-        print(f"Action: {decision.action}")
-        print(f"Symbol: {decision.symbol}")
-        print(f"Confidence: {decision.confidence:.1%}")
-        
-        print("\n[PASS] V1 debate runner test completed")
-        return True
-        
-    except Exception as e:
-        print(f"\n[ERROR] V1 Debate failed: {e}")
-        return False
-
-
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -249,7 +209,6 @@ def main():
     
     if run_api_tests:
         asyncio.run(test_debate_runner_v2())
-        asyncio.run(test_debate_runner_v1())
     else:
         print("\nSkipping API tests.")
     
@@ -260,7 +219,7 @@ def main():
     print("1. Start backend: cd python && python -m uvicorn app.main:app --reload")
     print("2. Start frontend: cd frontend && npm run dev")
     print("3. Go to http://localhost:3000/backtest")
-    print("4. Run a simulation - the V2 debate system is now the default!")
+    print("4. Run a simulation - Goldman Sachs Quant Architect debate system")
 
 
 if __name__ == "__main__":

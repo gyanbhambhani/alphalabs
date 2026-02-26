@@ -18,6 +18,7 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 from core.data.snapshot import GlobalMarketSnapshot
+from core.backtest.portfolio_tracker import BacktestPortfolio
 
 logger = logging.getLogger(__name__)
 

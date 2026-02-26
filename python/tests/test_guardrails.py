@@ -150,7 +150,7 @@ def test_no_trade_without_signals():
     This is tested at the debate_runner level - we verify that the
     _extract_signals_from_evidence function correctly identifies missing signals.
     """
-    from core.backtest.debate_runner import (
+    from core.backtest.screening import (
         get_feature_value,
         DecisionAuditTrail,
     )

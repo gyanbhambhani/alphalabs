@@ -32,7 +32,8 @@ from core.backtest.events import (
     ErrorEvent,
 )
 from core.backtest.debate_runner import (
-    DailyDebateRunner,
+    CollaborativeDebateRunner,
+    get_debate_runner,
     TradingDecision,
     DebateMessage,
 )
@@ -53,7 +54,8 @@ __all__ = [
     "BacktestPosition",
     "BacktestTrade",
     # Debate
-    "DailyDebateRunner",
+    "CollaborativeDebateRunner",
+    "get_debate_runner",
     "TradingDecision",
     "DebateMessage",
     # Simulation

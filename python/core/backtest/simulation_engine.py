@@ -33,7 +33,6 @@ from core.backtest.data_loader import HistoricalDataLoader
 from core.backtest.snapshot_builder import PointInTimeSnapshotBuilder
 from core.backtest.portfolio_tracker import BacktestPortfolio, BacktestTrade
 from core.backtest.debate_runner import (
-    DailyDebateRunner,
     CollaborativeDebateRunner,
     TradingDecision,
     get_debate_runner,
@@ -133,11 +132,10 @@ class SimulationEngine:
         speed_multiplier: float = 100.0,
         initial_cash: float = 100_000.0,
         persistence: Optional["BacktestPersistence"] = None,
-        debate_version: str = "v2",
     ):
         """
         Initialize the simulation engine.
-        
+
         Args:
             funds: List of fund configurations
             data_loader: Historical data loader
@@ -146,18 +144,12 @@ class SimulationEngine:
             speed_multiplier: Time dilation factor (100 = 100x speed)
             initial_cash: Starting cash per fund
             persistence: Optional persistence layer for saving training data
-            debate_version: "v1" for DailyDebateRunner, "v2" for CollaborativeDebateRunner
         """
         self.funds = funds
         self.data_loader = data_loader
         self.snapshot_builder = PointInTimeSnapshotBuilder(data_loader)
-        self.debate_version = debate_version
         # Disable ExperienceStore during backtest to prevent in-sample bias
-        # (learning from future outcomes that wouldn't be available in real trading)
-        self.debate_runner = get_debate_runner(
-            version=debate_version,
-            disable_experience_store=True,
-        )
+        self.debate_runner = get_debate_runner(disable_experience_store=True)
         self.persistence = persistence
         
         # Date range - default to 2001-01-02 to ensure 1 year of historical data
