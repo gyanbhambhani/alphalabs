@@ -41,6 +41,7 @@ from app.semantic_routes import router as semantic_router
 from app.research_routes import router as research_router
 from app.fund_routes import router as fund_router
 from app.terminal_routes import router as terminal_router
+from app.terminal_routes import _terminal_router
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ app.include_router(semantic_router)
 app.include_router(research_router)
 app.include_router(fund_router)
 app.include_router(terminal_router)
+app.include_router(_terminal_router)
 
 
 # Basic endpoints

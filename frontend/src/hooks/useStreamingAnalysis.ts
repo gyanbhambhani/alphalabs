@@ -27,8 +27,8 @@ export interface UseStreamingAnalysisReturn {
   /** Error message if status is 'error' */
   error: string | null;
   
-  /** Start analysis for given query and symbols */
-  analyze: (query: string, symbols: string[]) => Promise<void>;
+  /** Start analysis for given query and symbols (apiKey optional for BYOK) */
+  analyze: (query: string, symbols: string[], apiKey?: string) => Promise<void>;
   
   /** Cancel current analysis */
   cancel: () => void;
@@ -70,14 +70,13 @@ export function useStreamingAnalysis(): UseStreamingAnalysisReturn {
     setStatus('idle');
   }, [cancel]);
   
-  const analyze = useCallback(async (query: string, symbols: string[]) => {
-    // Reset previous state
-    reset();
-    setStatus('creating_session');
-    
-    try {
-      // Phase 1: Create session
-      const session = await api.createSearchSession(query, symbols);
+  const analyze = useCallback(
+    async (query: string, symbols: string[], apiKey?: string) => {
+      reset();
+      setStatus('creating_session');
+
+      try {
+        const session = await api.createSearchSession(query, symbols, apiKey);
       
       // Check if we got cached results
       if (session.cached && session.cachedChunks) {
@@ -131,13 +130,14 @@ export function useStreamingAnalysis(): UseStreamingAnalysisReturn {
         eventSource.close();
         eventSourceRef.current = null;
       };
-      
-    } catch (err) {
-      console.error('Analysis failed:', err);
-      setError(err instanceof Error ? err.message : 'Analysis failed');
-      setStatus('error');
-    }
-  }, [reset, status]);
+      } catch (err) {
+        console.error('Analysis failed:', err);
+        setError(err instanceof Error ? err.message : 'Analysis failed');
+        setStatus('error');
+      }
+    },
+    [reset, status]
+  );
   
   return {
     status,

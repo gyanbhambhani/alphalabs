@@ -1,7 +1,11 @@
-"""AI Stock Terminal API endpoints (Stream-First Architecture)"""
+"""AI Stock Terminal API endpoints (Stream-First Architecture)
+
+BYOK (Bring Your Own Key): Pass X-OpenAI-API-Key header for user-provided keys.
+Keys are used per-request only, never stored.
+"""
 from typing import Optional, List as TypingList
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from starlette.responses import StreamingResponse
@@ -32,6 +36,7 @@ class SearchSessionResponse(BaseModel):
 @router.post("/session", response_model=SearchSessionResponse)
 async def create_search_session(
     request: SearchSessionRequest,
+    http_request: Request,
 ):
     """
     Create a search analysis session.
@@ -63,10 +68,14 @@ async def create_search_session(
     if len(query) > 500:
         raise HTTPException(status_code=400, detail="Query too long (max 500 chars)")
 
+    # BYOK: User-provided API key (never stored, used per-request only)
+    byok_key = http_request.headers.get("X-OpenAI-API-Key", "").strip() or None
+
     try:
         session, cached_chunks = await session_manager.create_session(
             query=query,
-            symbols=symbols
+            symbols=symbols,
+            openai_api_key=byok_key,
         )
 
         if cached_chunks:
@@ -137,10 +146,24 @@ async def stream_analysis(
         """Generate SSE events from analyzer stream."""
         collected_chunks = []
 
+        # BYOK: Use user key from session if provided, else server config
+        api_key = session_manager.get_byok_key(session_id) or settings.openai_api_key
+        if not api_key:
+            error_data = json_module.dumps({
+                "type": "error",
+                "content": {
+                    "message": (
+                        "No API key. Add OPENAI_API_KEY to .env or pass "
+                        "X-OpenAI-API-Key header (BYOK)."
+                    )
+                },
+                "metadata": {}
+            })
+            yield f"data: {error_data}\n\n"
+            return
+
         try:
-            analyzer = StreamingQuantAnalyzer(
-                openai_api_key=settings.openai_api_key
-            )
+            analyzer = StreamingQuantAnalyzer(openai_api_key=api_key)
 
             async for chunk in analyzer.analyze_stream(session):
                 # Format as SSE
@@ -220,3 +243,55 @@ async def search_symbols(
             status_code=500,
             detail=f"Symbol search failed: {str(e)}"
         )
+
+
+# =============================================================================
+# Real-time data (Terminal ticker tape)
+# =============================================================================
+
+_terminal_router = APIRouter(prefix="/api/terminal", tags=["terminal"])
+
+
+@_terminal_router.get("/live")
+async def get_live_prices(
+    symbols: str = Query(
+        "SPY,AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA",
+        description="Comma-separated symbols",
+    ),
+):
+    """
+    Get live (or ~15min delayed) prices for ticker tape.
+
+    Uses Yahoo Finance free tier. No API key required.
+    """
+    import yfinance as yf
+
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
+    if not sym_list:
+        return {"prices": [], "timestamp": None}
+
+    result = []
+    for symbol in sym_list:
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.fast_info
+            prev = getattr(info, "previous_close", None) or info.last_price
+            change = (
+                (info.last_price - prev) / prev if prev and prev != 0 else 0
+            )
+            result.append({
+                "symbol": symbol,
+                "price": round(info.last_price, 2),
+                "change": round(change, 4),
+                "change_pct": round(change * 100, 2),
+            })
+        except Exception:
+            continue
+
+    from datetime import datetime
+    return {
+        "prices": result,
+        "timestamp": datetime.utcnow().isoformat(),
+        "source": "yahoo_finance",
+        "delay": "~15 min (free tier)",
+    }

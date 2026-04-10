@@ -58,7 +58,8 @@ class SessionManager:
         query: str,
         symbols: list[str],
         user_id: Optional[str] = None,
-        user_ip: Optional[str] = None
+        user_ip: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
     ) -> Tuple[Optional[AnalysisSession], Optional[list[dict]]]:
         """
         Create analysis session with rate limiting and deduplication.
@@ -93,7 +94,13 @@ class SessionManager:
         
         # 4. STORE SESSION
         await self._store_session(session)
-        
+
+        # 5. Store BYOK key in memory only (never persisted to Redis)
+        if openai_api_key and openai_api_key.startswith("sk-"):
+            if not hasattr(self, "_byok_keys"):
+                self._byok_keys: dict[str, str] = {}
+            self._byok_keys[session_id] = openai_api_key
+
         logger.info(f"Created session {session_id} for query: {query[:50]}...")
         return session, None
     
@@ -113,6 +120,12 @@ class SessionManager:
         if session_data:
             return AnalysisSession.from_dict(session_data)
         
+        return None
+
+    def get_byok_key(self, session_id: str) -> Optional[str]:
+        """Get user-provided API key for session (BYOK). Never persisted."""
+        if hasattr(self, "_byok_keys"):
+            return self._byok_keys.get(session_id)
         return None
     
     async def cache_result(
